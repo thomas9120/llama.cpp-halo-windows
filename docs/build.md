@@ -400,6 +400,31 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
 
+### Windows Strix Halo with TheRock ROCm 10
+
+From a regular PowerShell, run `.\build-windows.ps1` in the repository root. It selects Visual Studio 2022, configures the SDK paths, builds the server, CLI, and benchmark tools, and copies the OpenMP runtime beside the executables. The defaults are `C:\TheRock\build`, `gfx1151`, 12 parallel jobs, and the `build-rocm10-gfx1151` output directory. Use `-RocmPath`, `-BuildDir`, or `-Jobs` to override these settings, or `-ConfigureOnly` to configure without compiling.
+
+For `gfx1151` (Radeon 8060S), use a Visual Studio 2022 Developer PowerShell with the x64 toolchain. TheRock Clang 23 conflicts with the MSVC 14.51 math headers from Visual Studio 2026; MSVC 14.44 from Visual Studio 2022 avoids this build error.
+
+From the repository root, with the ROCm 10 SDK extracted to `C:\TheRock\build`:
+
+```powershell
+$env:HIP_PATH = 'C:\TheRock\build'
+$env:ROCM_PATH = $env:HIP_PATH
+$env:HIP_DEVICE_LIB_PATH = "$env:HIP_PATH\lib\llvm\amdgcn\bitcode"
+$env:PATH = "$env:HIP_PATH\bin;$env:HIP_PATH\lib\llvm\bin;$env:PATH"
+$env:CCACHE_DIR = "$PWD\build-rocm10-gfx1151\ccache"
+cmake -S . -B build-rocm10-gfx1151 -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    "-DCMAKE_C_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang.exe" `
+    "-DCMAKE_CXX_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang++.exe" `
+    "-DCMAKE_PREFIX_PATH=$env:HIP_PATH" -DGGML_HIP=ON -DGPU_TARGETS=gfx1151
+cmake --build build-rocm10-gfx1151 --target llama-server llama-cli llama-bench --parallel 12
+```
+
+Executables are in `build-rocm10-gfx1151\bin`. Keep the SDK's `bin` directory on `PATH` when running them. With OpenMP enabled, the Visual Studio runtime `libomp140.x86_64.dll` must also be on `PATH` or beside the executables. Use a fresh build directory when changing the compiler or Visual Studio toolchain.
+
+This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because of the output corruption reported in [pwilkin/llama.cpp#24](https://github.com/pwilkin/llama.cpp/issues/24). These controls are compiled in; setting that environment variable does not change them. Windows lazy direct reads still fall back to memory-mapped reads, and the lazy reader's prefetch hint is a no-op. Validate model answers and long-context retrieval before comparing performance.
+
 ## Vulkan
 
 ### For Windows Users:

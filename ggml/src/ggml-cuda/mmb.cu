@@ -612,7 +612,11 @@ int  mmb_min_t()   { return 512; }
 int  mmb_f32split_mode(){ return 2; }
 bool mmb_f32split() { return true; }
 bool mmb_bf16w()    { return true; }
+#ifdef _WIN32
+bool mmb_hc16()    { return false; }
+#else
 bool mmb_hc16()    { return true; }
+#endif
 int  mmb_tall_mode(){ return 2; }
 bool mmb_tall()    { return mmb_tall_mode() != 0; }
 bool mmb_gatemix_flag() { return true; }

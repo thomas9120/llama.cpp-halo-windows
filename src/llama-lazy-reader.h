@@ -26,6 +26,8 @@ struct llama_lazy_reader {
     void gather(const int32_t *, int64_t, float *) const {
         GGML_ABORT("lazy direct reads are not supported on this platform");
     }
+
+    void prefetch(const int32_t *, int64_t) const {}
 #else
     llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
