@@ -807,11 +807,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // excluded by requiring ubatch.token; keeping it shut the draft out of block selection, and with it out of
 // the maskless/packed-key layout and the qsa3 attention kernel.
 static bool qwen4exp_use_block_selection(bool blk_bias, int64_t n_stream, int64_t ratio, int64_t n_kv,
-        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams) {
+        const llama_ubatch & ubatch, const llama_cparams & cparams, const llama_hparams & hparams,
+        const llama_kv_cache_context * mctx_attn) {
+    // Block indices can include -1; only the direct sparse kernels accept them.
     return blk_bias && n_stream==1 && ratio>1 && hparams.indexer_top_k%ratio==0 &&
         n_kv>hparams.indexer_top_k+ratio-1 && n_kv<=16777216 && ubatch.token &&
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f &&
-        !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256;
+        !hparams.attn_soft_cap && hparams.n_embd_head_k()==256 && hparams.n_embd_head_v()==256 &&
+        mctx_attn->type_k()==GGML_TYPE_F16 && mctx_attn->type_v()==GGML_TYPE_F16;
 }
 
 static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream);
@@ -877,7 +880,7 @@ public:
         res &= bias->ne[0] == (compact ? n_blocks+params.ubatch.n_tokens : (blk_bias ? n_blocks : n_kv));
         res &= compact || bias->ne[1] == params.ubatch.n_tokens/n_stream;
         const bool blocks=qwen4exp_use_block_selection(blk_bias,n_stream,ratio,n_kv,
-                params.ubatch,params.cparams,params.hparams);
+                params.ubatch,params.cparams,params.hparams,mctx->get_attn());
         res &= (tail_idxs != nullptr) == blocks;
         const bool scalar=blocks && params.hparams.n_swa==0 && mctx->qsa_scalar_visibility(params.ubatch);
         res &= compact == scalar;
@@ -1055,7 +1058,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams) &&
+        const bool scalar = qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams,mctx_hyb->get_attn()) &&
             hparams.n_swa==0 && mctx_hyb->qsa_scalar_visibility(ubatch);
         qsa->incremental_prefix = r == 4 && mctx_hyb->qsa_prefix_matches(ubatch);
         qsa->compact = scalar;
@@ -1070,7 +1073,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
-        if (qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams)) {
+        if (qwen4exp_use_block_selection(blk_bias,n_stream,r,n_kv,ubatch,cparams,hparams,mctx_hyb->get_attn())) {
             GGML_ASSERT(hparams.indexer_top_k % r == 0);
             qsa->tail_idxs=ggml_new_tensor_3d(ctx0,GGML_TYPE_I32,r-1,n_tps,n_stream);
             ggml_set_input(qsa->tail_idxs);
@@ -1314,7 +1317,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
         const bool direct_indices =
             n_stream == 1 && cparams.flash_attn && cparams.offload_kqv &&
-            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap;
+            hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap && q_cur->ne[0] == 256 &&
+            mctx_cur->type_k() == GGML_TYPE_F16 && mctx_cur->type_v() == GGML_TYPE_F16;
         ggml_tensor * kq_mask_top_k = kq_mask;
         if (!direct_indices) {
         // prepare new kq mask - starts filled with -INFINITY
