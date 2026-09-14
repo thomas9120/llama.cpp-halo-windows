@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-Build the Windows HIP server, CLI, and benchmark tools for gfx1151.
+Build the Windows HIP server, CLI, benchmark, and parameter-fitting tools for gfx1151.
 .EXAMPLE
 .\build-windows.ps1
 .EXAMPLE
@@ -61,7 +61,7 @@ if ($ConfigureOnly) {
     return
 }
 
-cmake --build $BuildDir --target llama-server llama-cli llama-bench --parallel $Jobs
+cmake --build $BuildDir --target llama-server llama-cli llama-bench llama-fit-params --parallel $Jobs
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
 }
