@@ -12,24 +12,26 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
 struct llama_lazy_reader {
 #ifdef _WIN32
-    // pread()/open() are unavailable on Windows; --lazy-mode on-direct falls
-    // back to the lazy mmap reads there (see llama_model_base::load_lazy_reader)
-    const int64_t head_dim = 0;
-
-    void gather(const int32_t *, int64_t, float *) const {
-        GGML_ABORT("lazy direct reads are not supported on this platform");
-    }
-
-    void prefetch(const int32_t *, int64_t) const {}
+    using file_handle = HANDLE;
 #else
-    llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
+    using file_handle = int;
+#endif
+    llama_lazy_reader(file_handle fd, size_t base, size_t row_size, int64_t n_rows, int n_threads,
                       enum ggml_type type, int64_t head_dim)
         : fd(fd), base(base), row_size(row_size), n_rows(n_rows), n_threads(n_threads),
           head_dim(head_dim), to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
@@ -40,12 +42,16 @@ struct llama_lazy_reader {
     llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
 
     ~llama_lazy_reader() {
+#ifdef _WIN32
+        CloseHandle(fd);
+#else
         if (fd >= 0) {
             ::close(fd);
         }
+#endif
     }
 
-    const int      fd;
+    const file_handle fd;
     const size_t   base;       // file offset of row 0
     const size_t   row_size;   // bytes per quantized row
     const int64_t  n_rows;
@@ -117,10 +123,22 @@ struct llama_lazy_reader {
         const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, (int64_t) uniq.size() / 32));
         auto run = [&](int w) {
             const int64_t b = (int64_t) uniq.size() * w / n_workers, e = (int64_t) uniq.size() * (w + 1) / n_workers;
+#ifdef _WIN32
+            try {
+                read_event event;
+                std::vector<uint8_t> bounce(row_size);
+                for (int64_t i = b; i < e; ++i) {
+                    read_at(bounce.data(), base + (size_t) uniq[i] * row_size, event.handle);
+                }
+            } catch (...) {
+                // Prefetch is optional; gather reports read failures.
+            }
+#else
             for (int64_t i = b; i < e; ++i) {
                 const size_t off = base + (size_t) uniq[i] * row_size;
                 ::posix_fadvise(fd, (off_t) off, (off_t) row_size, POSIX_FADV_WILLNEED);
             }
+#endif
         };
         std::vector<std::thread> workers;
         try {
@@ -134,15 +152,60 @@ struct llama_lazy_reader {
     }
 
 private:
+#ifdef _WIN32
+    struct read_event {
+        HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        read_event() {
+            if (!handle) {
+                throw std::runtime_error(format("lazy direct read event creation failed: Windows error %lu", GetLastError()));
+            }
+        }
+        read_event(const read_event &) = delete;
+        read_event & operator=(const read_event &) = delete;
+        ~read_event() { CloseHandle(handle); }
+    };
+
+    void read_at(uint8_t * dst, size_t off, HANDLE event) const {
+        for (size_t done = 0; done < row_size; ) {
+            const uint64_t pos = (uint64_t) off + done;
+            OVERLAPPED op = {};
+            op.Offset = (DWORD) pos;
+            op.OffsetHigh = (DWORD) (pos >> 32);
+            op.hEvent = event;
+            DWORD n_read = 0;
+            const DWORD chunk = (DWORD) std::min<size_t>(row_size - done, 64 * 1024 * 1024);
+            BOOL ok = ReadFile(fd, dst + done, chunk, &n_read, &op);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                ok = GetOverlappedResult(fd, &op, &n_read, TRUE);
+            }
+            if (!ok) {
+                throw std::runtime_error(format("lazy direct read of %zu bytes at file offset %zu failed: Windows error %lu",
+                        row_size, off, GetLastError()));
+            }
+            if (n_read == 0) {
+                throw std::runtime_error(format("lazy direct read of %zu bytes at file offset %zu failed: unexpected EOF",
+                        row_size, off));
+            }
+            done += n_read;
+        }
+    }
+#endif
+
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
                    int64_t begin, int64_t end, float * dst) const {
         std::vector<uint8_t> bounce(row_size);
+#ifdef _WIN32
+        read_event event;
+#endif
         for (int64_t i = begin; i < end; ) {
             int64_t j = i;
             while (j + 1 < end && pairs[j + 1].first == pairs[i].first) {
                 ++j;
             }
             const size_t off = base + (size_t) pairs[i].first * row_size;
+#ifdef _WIN32
+            read_at(bounce.data(), off, event.handle);
+#else
             for (size_t done = 0; done < row_size; ) {
                 const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, off + done);
                 if (n_read < 0 && errno == EINTR) {
@@ -154,6 +217,7 @@ private:
                 }
                 done += n_read;
             }
+#endif
             float * first = dst + (size_t) pairs[i].second * head_dim;
             if (to_float) {
                 to_float(bounce.data(), first, head_dim);
@@ -166,5 +230,4 @@ private:
             i = j + 1;
         }
     }
-#endif
 };

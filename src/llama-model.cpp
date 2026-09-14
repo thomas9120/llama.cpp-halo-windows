@@ -32,7 +32,9 @@
 #include <cstdint>
 #include <thread>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -1863,7 +1865,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-#ifndef _WIN32
 const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
     if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
         return nullptr;
@@ -1883,6 +1884,15 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
         return nullptr;
     }
 
+#ifdef _WIN32
+    const HANDLE fd = ReOpenFile((HANDLE) _get_osfhandle(ml.files[w->idx]->file_id()), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS);
+    if (fd == INVALID_HANDLE_VALUE) {
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (Windows error %lu), using lazy mmap reads\n",
+                __func__, ml.files[w->idx]->name().c_str(), GetLastError());
+        return nullptr;
+    }
+#else
     // an independently opened buffered descriptor: dup() would share the
     // loader's open file description, whose readahead advice and O_DIRECT
     // flag would fight the small scattered row reads
@@ -1892,6 +1902,7 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
                 __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
         return nullptr;
     }
+#endif
 
 #ifdef __linux__
     ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
@@ -1910,14 +1921,6 @@ const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader 
     lazy_readers[tensor_name] = std::move(reader);
     return lazy_readers.at(tensor_name).get();
 }
-#else
-const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
-        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
-    }
-    return nullptr;
-}
-#endif
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;

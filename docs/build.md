@@ -423,7 +423,9 @@ cmake --build build-rocm10-gfx1151 --target llama-server llama-cli llama-bench l
 
 Executables are in `build-rocm10-gfx1151\bin`. Keep the SDK's `bin` directory on `PATH` when running them. With OpenMP enabled, the Visual Studio runtime `libomp140.x86_64.dll` must also be on `PATH` or beside the executables. Use a fresh build directory when changing the compiler or Visual Studio toolchain.
 
-This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because of the output corruption reported in [pwilkin/llama.cpp#24](https://github.com/pwilkin/llama.cpp/issues/24). These controls are compiled in; setting that environment variable does not change them. Windows lazy direct reads still fall back to memory-mapped reads, and the lazy reader's prefetch hint is a no-op. Validate model answers and long-context retrieval before comparing performance.
+This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because of the output corruption reported in [pwilkin/llama.cpp#24](https://github.com/pwilkin/llama.cpp/issues/24). These controls are compiled in; setting that environment variable does not change them. Validate model answers and long-context retrieval before comparing performance.
+
+For Qwen3.8-Flash-Next, `--lazy-mode on-direct` supports Windows through concurrent, buffered file reads for the PLE table, including speculative prefetch. The startup log reports `direct reads enabled` when active; if the file cannot be reopened, it warns and falls back to lazy memory-mapped reads. This mode still uses the Windows file cache. Compare it with `--lazy-mode on` using real prompts; performance depends on storage and available memory.
 
 ## Vulkan
 
