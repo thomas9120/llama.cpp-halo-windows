@@ -427,6 +427,16 @@ This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because
 
 For Qwen3.8-Flash-Next, `--lazy-mode on-direct` supports Windows through concurrent, buffered file reads for the PLE table, including speculative prefetch. The startup log reports `direct reads enabled` when active; if the file cannot be reopened, it warns and falls back to lazy memory-mapped reads. This mode still uses the Windows file cache. Compare it with `--lazy-mode on` using real prompts; performance depends on storage and available memory.
 
+#### Checking an upstream sync
+
+Run `.\test-windows.ps1` after merging or rebasing upstream, before copying binaries to a launcher. It rebuilds with `build-windows.ps1`, checks that all four tools start, runs synthetic lazy-reader tests, and runs the existing ROCm attention tests against their CPU reference. It requires the same SDK and VS 2022 installation as the build script, a `gfx1151` GPU, and a filesystem supporting sparse files. No model download is needed. `-RocmPath`, `-BuildDir`, and `-Jobs` override the build settings.
+
+The source guards flag changes to the three Windows HC16 workarounds, F16-only sparse attention selection, Windows direct-reader activation and prefetch, and the build target list. These are conservative checks of the current source structure, not proof of correctness: an upstream rewrite may require updating them after review. Do not remove a failing check just to accept a merge.
+
+The reader tests compare F32, F16, Q8_0, Q4_K, IQ4_NL, and IQ4_XS rows against memory-mapped reads, including concurrent gathers and prefetch, repeated indices, Unicode paths, offsets above 4 GiB, empty/single-row requests, and EOF errors. Test sources stay under `scripts/`; generated files and logs stay under `<BuildDir>/windows-regression`. Attention validation fails if either F16 or Q8 cases stop running, even if the backend test executable returns success. The runner temporarily clears the compiler-only `HIP_DEVICE_LIB_PATH` during GPU tests because leaving it set caused HIP initialization failures with the installed SDK/driver combination.
+
+Use `.\test-windows.ps1 -SourceOnly` for a quick check without compiling, or `-SkipGpu` when the GPU is busy. Both provide partial validation. The full suite does not load Qwen or exercise its complete graph: after a sync, also test a representative prompt with `--lazy-mode on-direct`, first with F16 K/V and then Q8 K/V, and confirm `direct reads enabled` in the startup log. Compare output quality and cold/warm prompt speed with the previous working build. Keep that build until the replacement passes these checks.
+
 ## Vulkan
 
 ### For Windows Users:
