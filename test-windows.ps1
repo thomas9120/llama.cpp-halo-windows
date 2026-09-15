@@ -40,6 +40,8 @@ Assert-Source 'src/llama-model.cpp' '(?s)#ifdef\s+_WIN32\s+const HANDLE fd\s*=\s
 Assert-Source 'src/models/qwen4exp.cpp' 'ple_reader\s*=\s*load_lazy_reader\(ml,\s*ple_name\.c_str\(\),\s*per_layer_tok_embd\)' 'Qwen PLE still connects to the direct reader'
 Assert-Source 'src/llama-lazy-reader.h' '(?s)void prefetch\([^#]*#ifdef\s+_WIN32\s+try\s*\{[^#]*read_at\(' 'Windows prefetch performs file reads'
 Assert-Source 'build-windows.ps1' '--target llama-server llama-cli llama-bench llama-fit-params\s' 'The build includes all four requested tools'
+Assert-Source 'tools/server/server-context.cpp' '(?s)SRV_ERR\("pre_decode\(\) failed:[^;]*;\s*batch\.clear\(\);\s*abort_all_slots\(' 'Failed batch construction discards partial tokens'
+Assert-Source 'tools/server/server-context.cpp' '(?s)void abort_all_slots\([^{}]*\)\s*\{.*?slot\.release\(\);\s*slot\.prompt_clear\(\);' 'Aborted slots discard incomplete cached prompts'
 
 if ($SourceOnly) {
     Write-Host 'Source guards passed. Build and runtime tests were not run.'
@@ -96,6 +98,20 @@ try {
     }
     Remove-Item -LiteralPath $RunDir
     Get-Content -LiteralPath (Join-Path $LogDir 'reader-runtime.log') | Out-Host
+
+    $RecoveryExe = Join-Path $LogDir 'test-server-recovery.exe'
+    $RecoveryLibs = @(
+        'tools/server/server-context.lib', 'tools/server/llama-server-impl.lib',
+        'common/llama-common.lib', 'common/llama-common-base.lib', 'tools/mtmd/mtmd.lib',
+        'src/llama.lib', 'ggml/src/ggml.lib', 'ggml/src/ggml-base.lib', 'vendor/cpp-httplib/cpp-httplib.lib'
+    ) | ForEach-Object { Join-Path $BuildDir $_ }
+    Invoke-Logged 'server-recovery-build' (Join-Path $RocmPath 'lib/llvm/bin/clang++.exe') (@(
+        '-std=c++17', '-O1', '-fms-runtime-lib=dll', '-fno-access-control',
+        '-DGGML_SHARED', '-DLLAMA_SHARED', '-DLLAMA_SUBPROCESS', '-D_CRT_SECURE_NO_WARNINGS',
+        '-I.', '-Icommon', '-Ivendor', '-Iinclude', '-Iggml/include', '-Itools/server', '-Itools/mtmd',
+        "-I$BuildDir/tools/server", 'scripts/windows-server-recovery.cpp', '-lws2_32', '-o', $RecoveryExe
+    ) + $RecoveryLibs)
+    Invoke-Logged 'server-recovery-runtime' $RecoveryExe @()
 
     if ($SkipGpu) {
         Write-Warning 'GPU checks skipped; this is a partial validation.'

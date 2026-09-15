@@ -2740,6 +2740,10 @@ private:
             try {
                 callback(slot);
             } catch (const std::exception & e) {
+                // Batch construction can have partial changes; let update_slots discard the whole batch.
+                if (!batch.batch_rendered) {
+                    throw;
+                }
                 SLT_ERR(slot, "got exception: %s\n", e.what());
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
@@ -2752,6 +2756,9 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
+                if (!batch.batch_rendered) {
+                    throw;
+                }
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
@@ -2764,6 +2771,7 @@ private:
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
+                slot.prompt_clear();
             }
         }
     }
@@ -2845,6 +2853,7 @@ private:
             batch.render();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
+            batch.clear();
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
             // the batch is half-built and not rendered, skip now to avoid UB

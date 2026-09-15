@@ -437,6 +437,8 @@ The reader tests compare F32, F16, Q8_0, Q4_K, IQ4_NL, and IQ4_XS rows against m
 
 Use `.\test-windows.ps1 -SourceOnly` for a quick check without compiling, or `-SkipGpu` when the GPU is busy. Both provide partial validation. The full suite does not load Qwen or exercise its complete graph: after a sync, also test a representative prompt with `--lazy-mode on-direct`, first with F16 K/V and then Q8 K/V, and confirm `direct reads enabled` in the startup log. Compare output quality and cold/warm prompt speed with the previous working build. Keep that build until the replacement passes these checks.
 
+The suite also injects `std::bad_alloc` into both server slot iteration paths during batch construction, checks that the exception propagates, and verifies that a fresh batch can be built afterward. Source guards cover discarding the partial batch and clearing aborted prompt caches. This tests recovery without exhausting system memory; it does not prove that a particular model configuration fits.
+
 ## Vulkan
 
 ### For Windows Users:
