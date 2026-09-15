@@ -175,6 +175,7 @@ public:
     uint32_t get_n_stream() const;
     bool qsa_scalar_visibility(const llama_ubatch & ubatch) const;
     bool qsa_position_prefix(const llama_ubatch & ubatch) const;
+    bool qsa_contiguous_cells(const llama_ubatch & ubatch) const;
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
@@ -185,6 +186,7 @@ public:
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
+    mutable int contiguous_cells = -1;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

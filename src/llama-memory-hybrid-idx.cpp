@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 
 //
@@ -399,6 +400,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
     std::vector<int32_t>  blk_of(n_kv);
     std::vector<int32_t>  cell_grp(n_kv);
     std::vector<int32_t>  grp_head(n_blocks);
+    std::map<int64_t, int32_t> extra_heads;
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -437,10 +439,6 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
 
         const bool one_seq = n_seq_present <= 1;
 
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
-        bool oor = false;
-
         bool dup = false;
 
         bool ranked = false;
@@ -450,6 +448,7 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             std::fill(blk_of.begin(),   blk_of.end(),   -1);
             std::fill(cell_grp.begin(), cell_grp.end(), -1);
             std::fill(grp_head.begin(), grp_head.end(), -1);
+            extra_heads.clear();
 
             grp_next .clear();
             grp_first.clear();
@@ -457,7 +456,6 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             grp_slots.clear();
             grp_bid  .clear();
 
-            oor = false;
             dup = false;
 
             for (int64_t j = 0; j < n_kv; ++j) {
@@ -468,14 +466,12 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
                 const int64_t pb  = idx/r;
 
-                if (pb >= n_blocks) {
-                    oor = true;
-                    continue;
-                }
+                // Logical positions can exceed the physical cell window after skipped image input.
+                int32_t & head = pb < n_blocks ? grp_head[pb] : extra_heads.try_emplace(pb, -1).first->second;
 
                 int32_t g = -1;
 
-                for (int32_t c = grp_head[pb]; c >= 0; c = grp_next[c]) {
+                for (int32_t c = head; c >= 0; c = grp_next[c]) {
                     if (one_seq || cells.seq_get_all((uint32_t) grp_first[c]) == cells.seq_get_all((uint32_t) j)) {
                         g = c;
                         break;
@@ -485,13 +481,13 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 if (g < 0) {
                     g = (int32_t) grp_first.size();
 
-                    grp_next .push_back(grp_head[pb]);
+                    grp_next .push_back(head);
                     grp_first.push_back((int32_t) j);
                     grp_slot0.push_back(-1);
                     grp_slots.push_back(0);
                     grp_bid  .push_back(-1);
 
-                    grp_head[pb] = g;
+                    head = g;
                 }
 
                 const uint64_t bit = uint64_t(1) << (idx%r);
@@ -545,12 +541,10 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             group_cells();
         }
 
-        GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
-
         int32_t n_bid = 0;
 
-        for (int64_t pb = 0; pb < n_blocks; ++pb) {
-            for (int32_t g = grp_head[pb]; g >= 0; g = grp_next[g]) {
+        auto add_blocks = [&](int64_t pb, int32_t head) {
+            for (int32_t g = head; g >= 0; g = grp_next[g]) {
                 if (grp_slots[g] != slots_full) {
                     continue;
                 }
@@ -561,6 +555,13 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
                 bid_cell .push_back(grp_first[g]);
                 bid_slot0.push_back(grp_slot0[g]);
             }
+        };
+
+        for (int64_t pb = 0; pb < n_blocks; ++pb) {
+            add_blocks(pb, grp_head[pb]);
+        }
+        for (const auto & entry : extra_heads) {
+            add_blocks(entry.first, entry.second);
         }
 
         GGML_ASSERT(n_bid <= n_blocks);
@@ -656,9 +657,11 @@ void llama_memory_hybrid_idx::set_input_qsa_impl(
             const int64_t tail_start = (q + 1)/r*r;
             if (dst_tail && q+1>tail_start) {
                 const int64_t pb=tail_start/r;
-                if (pb>=0 && pb<n_blocks) {
+                if (pb>=0) {
+                    const auto extra = extra_heads.find(pb);
+                    const int32_t head = pb<n_blocks ? grp_head[pb] : (extra!=extra_heads.end() ? extra->second : -1);
                     int32_t * tail=dst_tail+(s*n_tps+ii)*(r-1);
-                    for (int32_t g=grp_head[pb];g>=0;g=grp_next[g]) {
+                    for (int32_t g=head;g>=0;g=grp_next[g]) {
                         if (!cells.seq_has((uint32_t)grp_first[g],seq_id)) { continue; }
                         for (int64_t slot=0;slot<q+1-tail_start;++slot) {
                             const int32_t cell=group_members[g*r+slot];
@@ -774,6 +777,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
 
 bool llama_memory_hybrid_idx_context::next() {
+    contiguous_cells = -1;
     if (ctx_idx) {
         ctx_idx->next();
     }
@@ -784,6 +788,7 @@ bool llama_memory_hybrid_idx_context::next() {
 }
 
 bool llama_memory_hybrid_idx_context::apply() {
+    contiguous_cells = -1;
     bool res = llama_memory_hybrid_context::apply();
 
     if (ctx_idx) {
@@ -831,6 +836,20 @@ bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & u
     if (!qsa_scalar_visibility(ubatch)) { return false; }
     const llama_seq_id seq=ubatch.seq_id[0][0];
     return qsa_single_sequence_prefix(mem->get_mem_idx()->get_cells(seq),get_idx()->get_n_kv(),seq);
+}
+
+bool llama_memory_hybrid_idx_context::qsa_contiguous_cells(const llama_ubatch & ubatch) const {
+    if (qsa_prefix_matches(ubatch)) { return true; }
+    if (contiguous_cells >= 0) { return contiguous_cells != 0; }
+    contiguous_cells = 0;
+    const uint32_t ns = get_n_stream();
+    if (!get_idx() || !ns || !ubatch.n_tokens || ubatch.n_tokens % ns != 0 || !ubatch.seq_id) { return false; }
+    for (uint32_t s = 0; s < ns; ++s) {
+        const auto seq = ubatch.seq_id[s*(ubatch.n_tokens/ns)][0];
+        if (!qsa_contiguous_sequences(mem->get_mem_idx()->get_cells(seq), get_idx()->get_n_kv())) { return false; }
+    }
+    contiguous_cells = 1;
+    return true;
 }
 
 bool llama_memory_hybrid_idx_context::qsa_scalar_visibility(const llama_ubatch & ubatch) const {

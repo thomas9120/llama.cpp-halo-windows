@@ -5,6 +5,26 @@
 #include <cstdint>
 #include <vector>
 
+// A per-block bias can share one spare block only when unpooled cells are sequence tails.
+static bool qsa_contiguous_sequences(const llama_kv_cells & cells, uint32_t count) {
+    if (count > cells.size()) { return false; }
+    std::vector<std::pair<llama_seq_id, llama_pos>> positions;
+    positions.reserve(cells.get_used());
+    for (uint32_t i = 0; i < count; ++i) {
+        if (cells.is_empty(i)) { continue; }
+        if (cells.seq_count(i) != 1) { return false; }
+        positions.emplace_back(cells.seq_get(i), cells.pos_get(i));
+    }
+    std::sort(positions.begin(), positions.end());
+    llama_seq_id seq = -1;
+    llama_pos next = 0;
+    for (const auto & entry : positions) {
+        if (entry.first != seq) { seq = entry.first; next = 0; }
+        if (entry.second != next++) { return false; }
+    }
+    return true;
+}
+
 static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {
     if (count>cells.size()) { return false; }
     std::vector<llama_pos> positions;

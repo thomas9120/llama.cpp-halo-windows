@@ -42,6 +42,9 @@ Assert-Source 'src/llama-lazy-reader.h' '(?s)void prefetch\([^#]*#ifdef\s+_WIN32
 Assert-Source 'build-windows.ps1' '--target llama-server llama-cli llama-bench llama-fit-params\s' 'The build includes all four requested tools'
 Assert-Source 'tools/server/server-context.cpp' '(?s)SRV_ERR\("pre_decode\(\) failed:[^;]*;\s*batch\.clear\(\);\s*abort_all_slots\(' 'Failed batch construction discards partial tokens'
 Assert-Source 'tools/server/server-context.cpp' '(?s)void abort_all_slots\([^{}]*\)\s*\{.*?slot\.release\(\);\s*slot\.prompt_clear\(\);' 'Aborted slots discard incomplete cached prompts'
+Assert-Source 'src/models/qwen4exp.cpp' 'res\s*&=\s*contiguous_cells\s*==\s*mctx->qsa_contiguous_cells\(params.ubatch\)' 'QSA graph reuse checks cache layout changes'
+Assert-Source 'src/models/qwen4exp.cpp' '(?s)const bool blk_bias\s*=[^;]*qsa_contiguous_cells\(ubatch\)\s*\|\|\s*qwen4exp_use_block_selection\(' 'Gapped Q8 caches use per-cell visibility'
+Assert-Source 'src/models/qwen4exp.cpp' 'kq_mask\s*=\s*qwen4exp_apply_cell_visibility\(ctx0,\s*kq_mask,\s*shared_qsa->second->bias,\s*first\)' 'Final QSA attention preserves per-cell exclusions'
 
 if ($SourceOnly) {
     Write-Host 'Source guards passed. Build and runtime tests were not run.'
@@ -113,6 +116,27 @@ try {
     ) + $RecoveryLibs)
     Invoke-Logged 'server-recovery-runtime' $RecoveryExe @()
 
+    # Compile the production metadata function with lightweight cache adapters.
+    $QsaSource = Get-Content (Join-Path $RepoRoot 'src/llama-memory-hybrid-idx.cpp') -Raw
+    $QsaStart = $QsaSource.IndexOf('void llama_memory_hybrid_idx::set_input_qsa_impl(')
+    if ($QsaStart -lt 0) { throw 'QSA test extraction needs review after an upstream change.' }
+    $QsaEnd = $QsaSource.IndexOf('// llama_memory_hybrid_idx_context', $QsaStart)
+    if ($QsaEnd -le $QsaStart) { throw 'QSA test extraction needs review after an upstream change.' }
+    Set-Content -LiteralPath (Join-Path $LogDir 'qsa-input-test.inc') -Value $QsaSource.Substring($QsaStart, $QsaEnd-$QsaStart) -Encoding ascii
+    $QwenSource = Get-Content (Join-Path $RepoRoot 'src/models/qwen4exp.cpp') -Raw
+    $Visibility = [regex]::Match($QwenSource, '(?ms)^static ggml_tensor \* qwen4exp_apply_cell_visibility\(.*?^\}')
+    if (-not $Visibility.Success) { throw 'QSA visibility test extraction needs review after an upstream change.' }
+    Set-Content -LiteralPath (Join-Path $LogDir 'qsa-visibility-test.inc') -Value $Visibility.Value -Encoding ascii
+    $QsaExe = Join-Path $LogDir 'test-qsa.exe'
+    Invoke-Logged 'qsa-build' (Join-Path $RocmPath 'lib/llvm/bin/clang++.exe') @(
+        '-std=c++17', '-O2', '-fms-runtime-lib=dll', '-DGGML_SHARED',
+        '-Isrc', '-Iinclude', '-Iggml/include', "-I$LogDir", 'scripts/windows-qsa.cpp',
+        (Join-Path $BuildDir 'ggml/src/ggml-base.lib'), (Join-Path $BuildDir 'ggml/src/ggml-cpu.lib'),
+        (Join-Path $BuildDir 'ggml/src/ggml.lib'), '-o', $QsaExe
+    )
+    Invoke-Logged 'qsa-runtime' $QsaExe @()
+    Get-Content -LiteralPath (Join-Path $LogDir 'qsa-runtime.log') | Out-Host
+
     if ($SkipGpu) {
         Write-Warning 'GPU checks skipped; this is a partial validation.'
     } else {
@@ -123,6 +147,7 @@ try {
             $env:LLAMA_TEST_FA_VEC_DISABLE = '1'
             # This compiler-only path causes HIP runtime initialization failures on this SDK/driver combination.
             $env:HIP_DEVICE_LIB_PATH = $null
+            Invoke-Logged 'qsa-gpu' $QsaExe @('--gpu')
             Invoke-Logged 'attention' (Join-Path $BinDir 'test-backend-ops.exe') @(
                 'test', '-b', 'ROCm0', '-o', 'FLASH_ATTN_EXT', '-p', 'hsk=256,hsv=256,nh=2,'
             )

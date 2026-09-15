@@ -869,6 +869,7 @@ public:
         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
 
         bool res = incremental_prefix == (ratio == 4 && mctx->qsa_prefix_matches(params.ubatch));
+        res &= contiguous_cells == mctx->qsa_contiguous_cells(params.ubatch);
 
         res &= params.ubatch.n_tokens % n_stream == 0;
 
@@ -905,6 +906,8 @@ public:
 
     ggml_tensor * tail_idxs = nullptr;
     bool incremental_prefix = false;
+    bool contiguous_cells = false;
+    bool use_kq_mask = false;
     bool compact = false;
     bool maskless = false;
     int64_t score_strip = 0;
@@ -1014,6 +1017,17 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
+static ggml_tensor * qwen4exp_apply_cell_visibility(ggml_context * ctx, ggml_tensor * mask,
+        ggml_tensor * bias, int64_t first) {
+    auto * cell_bias = ggml_view_4d(ctx, bias, bias->ne[0], mask->ne[1], 1, mask->ne[3],
+            bias->nb[1], bias->nb[2], bias->nb[2], first*bias->nb[1]);
+    if (!ggml_is_contiguous(cell_bias)) { cell_bias = ggml_cont(ctx, cell_bias); }
+    // Keep exclusions from top-k padding without adding the tail's selection priority to attention logits.
+    auto * visibility = ggml_clamp(ctx, cell_bias, -INFINITY, 0.0f);
+    if (visibility->type != mask->type) { visibility = ggml_cast(ctx, visibility, mask->type); }
+    return ggml_add(ctx, mask, visibility);
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
@@ -1041,9 +1055,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
-    const bool blk_bias = kq_mask != nullptr &&
+    const bool use_kq_mask = kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
+    const bool blk_bias = use_kq_mask &&
+        (mctx_hyb->qsa_contiguous_cells(ubatch) ||
+         qwen4exp_use_block_selection(true, n_stream, r, n_kv, ubatch, cparams, hparams, mctx_hyb->get_attn()));
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1053,6 +1070,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         inp = it->second;
     } else {
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        qsa->contiguous_cells = mctx_hyb->qsa_contiguous_cells(ubatch);
+        qsa->use_kq_mask = use_kq_mask;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
@@ -1217,11 +1236,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
                 ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
         expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
 
-        if (blk_bias) {
+        if (inp->use_kq_mask) {
             // flash attention keeps the mask in f16; the scores are f32
             ggml_tensor * mask = query_mask->type == GGML_TYPE_F32 ? query_mask : ggml_cast(ctx0, query_mask, GGML_TYPE_F32);
             expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_query, n_stream));
-        } else {
+        }
+        if (!blk_bias) {
             expanded = ggml_add(ctx0, expanded, bias);
         }
         cb(expanded, "indexer_score_tokens", il);
@@ -1312,6 +1332,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t n_query = std::min(strip, n_tps - first);
         ggml_tensor * kq_mask = ggml_view_4d(ctx0, mask_all, mask_all->ne[0], n_query, 1, n_stream,
                 mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], first*mask_all->nb[1]);
+        if (shared_qsa != qsa_inps.end() && shared_qsa->second->use_kq_mask && !shared_qsa->second->blk_bias) {
+            kq_mask = qwen4exp_apply_cell_visibility(ctx0, kq_mask, shared_qsa->second->bias, first);
+        }
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
 

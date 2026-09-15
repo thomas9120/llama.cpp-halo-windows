@@ -439,6 +439,8 @@ Use `.\test-windows.ps1 -SourceOnly` for a quick check without compiling, or `-S
 
 The suite also injects `std::bad_alloc` into both server slot iteration paths during batch construction, checks that the exception propagates, and verifies that a fresh batch can be built afterward. Source guards cover discarding the partial batch and clearing aborted prompt caches. This tests recovery without exhausting system memory; it does not prove that a particular model configuration fits.
 
+The QSA metadata test compiles the current production function with lightweight cache adapters. It checks screenshot-induced position gaps, complete blocks beyond the physical cache window, incomplete blocks, permuted cells, and two sequences sharing a cache. Per-cell, per-block, and compact visibility are compared against a logical-position reference. The final attention-mask helper runs on CPU and ROCm with F32 and F16 mask storage. Gapped Q8 caches use per-cell masking; F16 block selection retains explicit tail indices. These checks do not validate the MTP model's image handling or reproduce the full server workload: also test a screenshot conversation with the rebuilt binaries.
+
 ## Vulkan
 
 ### For Windows Users:
