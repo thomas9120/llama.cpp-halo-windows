@@ -16,6 +16,7 @@ static void check_iteration(server_context_impl & server, Slots & slots) {
         server.iterate(slots, [&](server_slot & slot) {
             ++visited;
             server.batch.add(slot.id, 1, 0, false, true);
+            slot.allocation_stage = "test batch construction";
             throw std::bad_alloc();
         });
     } catch (const std::bad_alloc &) {
@@ -32,6 +33,15 @@ static void check_iteration(server_context_impl & server, Slots & slots) {
     });
     server.batch.render();
     check(server.batch.size() == 2 && server.batch.slot_batched, "next batch did not recover");
+
+    visited = 0;
+    server.iterate(slots, [&](server_slot & slot) {
+        check(std::string(slot.allocation_stage) == "slot callback", "allocation stage was not reset");
+        ++visited;
+        slot.allocation_stage = "test generation";
+        throw std::bad_alloc();
+    });
+    check(visited == 2, "rendered batch failure did not retain per-slot recovery");
 }
 
 int main() {
@@ -47,7 +57,7 @@ int main() {
         check_iteration(server, server.slots);
         std::vector<server_slot *> pointers { &server.slots[0], &server.slots[1] };
         check_iteration(server, pointers);
-        printf("PASS: both slot iterators propagate allocation failures and allow a fresh batch\n");
+        printf("PASS: both slot iterators report allocation failures and preserve batch and per-slot recovery\n");
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "FAIL: %s\n", e.what());

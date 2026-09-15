@@ -34,6 +34,7 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -238,6 +239,7 @@ struct server_batch {
 
 struct server_slot {
     int id;
+    const char * allocation_stage = "slot callback";
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -2315,6 +2317,7 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        slot.allocation_stage = "checkpoint list";
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2368,15 +2371,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        slot.allocation_stage = "checkpoint target state";
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        slot.allocation_stage = "checkpoint draft state";
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
+        slot.allocation_stage = "checkpoint speculative state";
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        slot.allocation_stage = "checkpoint complete";
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2735,11 +2742,50 @@ private:
         return true;
     }
 
+    void report_allocation_failure(const server_slot & slot, const std::exception & e) const noexcept {
+        if (dynamic_cast<const std::bad_alloc *>(&e) == nullptr) {
+            return;
+        }
+        // Logging must not replace the original allocation failure.
+        try {
+#if defined(_WIN32)
+            PERFORMANCE_INFORMATION perf = {};
+            PROCESS_MEMORY_COUNTERS_EX proc = {};
+            const bool have_perf = K32GetPerformanceInfo(&perf, sizeof(perf));
+            const bool have_proc = K32GetProcessMemoryInfo(GetCurrentProcess(),
+                    reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&proc), sizeof(proc));
+#endif
+            size_t checkpoint_capacity = 0;
+            for (const auto & ckpt : slot.prompt.checkpoints) {
+                checkpoint_capacity += ckpt.data_tgt.capacity() + ckpt.data_dft.capacity() + ckpt.data_spec.capacity();
+            }
+            SLT_ERR(slot, "allocation failure: stage=%s, batch_rendered=%d, n_tokens=%d, n_gen=%" PRIu64 ", draft=%zu, checkpoints=%zu, checkpoint_capacity=%.3f MiB, spec_checkpoint=%.3f MiB\n",
+                    slot.allocation_stage, batch.batch_rendered, slot.prompt.n_tokens(), slot.stats.n_gen,
+                    slot.spec_draft.size(), slot.prompt.checkpoints.size(), checkpoint_capacity / 1048576.0,
+                    (slot.spec_ckpt.data_tgt.capacity() + slot.spec_ckpt.data_dft.capacity() + slot.spec_ckpt.data_spec.capacity()) / 1048576.0);
+#if defined(_WIN32)
+            if (have_perf) {
+                SLT_ERR(slot, "Windows memory: system_commit=%.3f MiB, commit_limit=%.3f MiB, physical_available=%.3f MiB\n",
+                        perf.CommitTotal * (double) perf.PageSize / 1048576.0,
+                        perf.CommitLimit * (double) perf.PageSize / 1048576.0,
+                        perf.PhysicalAvailable * (double) perf.PageSize / 1048576.0);
+            }
+            if (have_proc) {
+                SLT_ERR(slot, "Windows process: private_commit=%.3f MiB, working_set=%.3f MiB\n",
+                        proc.PrivateUsage / 1048576.0, proc.WorkingSetSize / 1048576.0);
+            }
+#endif
+        } catch (...) {
+        }
+    }
+
     void iterate(std::vector<server_slot> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
+                slot.allocation_stage = "slot callback";
                 callback(slot);
             } catch (const std::exception & e) {
+                report_allocation_failure(slot, e);
                 // Batch construction can have partial changes; let update_slots discard the whole batch.
                 if (!batch.batch_rendered) {
                     throw;
@@ -2754,8 +2800,10 @@ private:
     void iterate(std::vector<server_slot *> & slots, std::function<void(server_slot &)> callback) {
         for (auto & slot : slots) {
             try {
+                slot->allocation_stage = "slot callback";
                 callback(*slot);
             } catch (const std::exception & e) {
+                report_allocation_failure(*slot, e);
                 if (!batch.batch_rendered) {
                     throw;
                 }
@@ -3037,9 +3085,11 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            slot.allocation_stage = "speculative checkpoint draft state";
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        slot.allocation_stage = "speculative prompt copy";
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
@@ -3076,9 +3126,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
+                    slot.allocation_stage = "speculative draft restore";
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
+                slot.allocation_stage = "speculative draft trim";
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
                 }
@@ -3095,6 +3147,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    slot.allocation_stage = "speculative checkpoint target state";
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
@@ -3107,6 +3160,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    slot.allocation_stage = "speculative checkpoint draft state";
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
@@ -3617,7 +3671,9 @@ private:
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
 
+                        slot.allocation_stage = "prompt sampler initialization";
                         slot.init_sampler();
+                        slot.allocation_stage = "prompt checkpoint decision";
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3854,6 +3910,7 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 if (slot.can_speculate()) {
+                    slot.allocation_stage = "speculative begin";
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -3869,12 +3926,14 @@ private:
 
             llama_token id;
             {
+                slot.allocation_stage = "sample token";
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
             slot.i_batch = -1;
 
+            slot.allocation_stage = "accept token";
             common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
@@ -3890,6 +3949,7 @@ private:
 
             slot.stats.update_gen_last();
 
+            slot.allocation_stage = "token response";
             completion_token_output result;
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
@@ -3925,9 +3985,11 @@ private:
 
             // verify and try to accept the draft
             {
+                slot.allocation_stage = "speculative sampler clone";
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                slot.allocation_stage = "speculative sample and accept";
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
@@ -3959,15 +4021,19 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        slot.allocation_stage = "speculative target restore";
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
+                            slot.allocation_stage = "speculative draft restore";
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
+                        slot.allocation_stage = "speculative rollback trim";
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        slot.allocation_stage = "speculative sampler restore";
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
@@ -3978,11 +4044,13 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
+                slot.allocation_stage = "speculative accept state";
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }
 
+            slot.allocation_stage = "speculative accepted prompt update";
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
@@ -4012,8 +4080,10 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            slot.allocation_stage = "speculative accepted cache trim";
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            slot.allocation_stage = "speculative token response";
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 

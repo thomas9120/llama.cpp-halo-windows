@@ -115,6 +115,16 @@ try {
         "-I$BuildDir/tools/server", 'scripts/windows-server-recovery.cpp', '-lws2_32', '-o', $RecoveryExe
     ) + $RecoveryLibs)
     Invoke-Logged 'server-recovery-runtime' $RecoveryExe @()
+    $RecoveryLog = Get-Content -LiteralPath (Join-Path $LogDir 'server-recovery-runtime.log') -Raw
+    foreach ($Pattern in @(
+        'allocation failure: stage=test batch construction, batch_rendered=0',
+        'allocation failure: stage=test generation, batch_rendered=1',
+        'Windows memory: system_commit=', 'Windows process: private_commit='
+    )) {
+        if ($RecoveryLog -notmatch [regex]::Escape($Pattern)) {
+            throw "Missing allocation diagnostic: $Pattern"
+        }
+    }
 
     # Compile the production metadata function with lightweight cache adapters.
     $QsaSource = Get-Content (Join-Path $RepoRoot 'src/llama-memory-hybrid-idx.cpp') -Raw
