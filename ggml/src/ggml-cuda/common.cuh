@@ -1574,6 +1574,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3), see ggml_cuda_mm_fusion_args_device
+    const ggml_tensor * y_gate = nullptr;
+    const ggml_tensor * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1583,6 +1587,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // RDNA3.5 fused-quantize matvec prologue (y_op == 3): y' = sigmoid(y_gate) * (rms_norm_128(y) * y_norm_w)
+    const void * y_gate = nullptr;
+    const void * y_norm_w = nullptr;
+    float y_eps = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {
