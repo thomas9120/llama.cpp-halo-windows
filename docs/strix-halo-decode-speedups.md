@@ -56,7 +56,7 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
    MoE selection; halo's 256-expert routed-compact selection,
    swiglu/pair decls, and whitespace-only hunks stay deferred.
 9. Compact MUL_MAT_ID 512x10 (`mmid.cu`). Spec-verify win.
-   DEFERRED.
+   PORTED (commit `19a7318df`); file is now identical to halo.
 10. hyperconn vs hc-*: halo renamed `hc-cn/mix.cu` to `hyperconn.*`
     with BF16-only streams + `mmb_enabled()` gated to RDNA3.5.
     Reconcile with the Windows build before touching. DEFERRED.
