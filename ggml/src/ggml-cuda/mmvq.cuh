@@ -16,3 +16,9 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// RDNA3.5 fused-quantize matvec with an activation prologue: y' = op(y_scale*y + y_bias) (op 1 = silu, 2 = sigmoid)
+// applied while the activations are quantized in-kernel. `y` replaces dst->src[1] (same shape, F32, contiguous).
+bool ggml_cuda_mul_mat_vec_q_fq_prologue_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const ggml_tensor * y);
+void ggml_cuda_mul_mat_vec_q_fq_prologue(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * y,
+        float y_scale, float y_bias, int y_op);
