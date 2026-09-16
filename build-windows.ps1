@@ -13,6 +13,7 @@ param(
     [string]$BuildDir = 'build-rocm10-gfx1151',
     [ValidateRange(1, 256)]
     [int]$Jobs = 12,
+    [switch]$Portable,
     [switch]$ConfigureOnly
 )
 
@@ -50,10 +51,12 @@ Write-Host "ROCm SDK: $RocmPath"
 Write-Host "Build directory: $BuildDir"
 Write-Host "Target: gfx1151, Release, $Jobs parallel jobs"
 
+$NativeCpu = if ($Portable) { 'OFF' } else { 'ON' }
+$StaticOpenSsl = if ($Portable) { 'ON' } else { 'OFF' }
 cmake -S $PSScriptRoot -B $BuildDir -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$Clang" "-DCMAKE_CXX_COMPILER=$ClangCpp" `
     "-DCMAKE_PREFIX_PATH=$RocmPath" -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 `
-    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    "-DGGML_NATIVE=$NativeCpu" "-DOPENSSL_USE_STATIC_LIBS=$StaticOpenSsl" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 if ($LASTEXITCODE -ne 0) {
     throw "CMake configuration failed with exit code $LASTEXITCODE. Use a new -BuildDir when changing toolchains."
 }
