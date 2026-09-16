@@ -13,7 +13,7 @@ class llama_kv_cache_context;
 // GLM-5-Next indexer pooling. no input may hold a negative index (ggml_set_rows asserts
 // i1 >= 0, ggml_get_rows has no sentinel), so unusable entries are clamped and masked.
 
-// n_kv/kpool (exact only while the sequences' cells are disjoint) plus 2 per seq for rebasing
+// Each sequence can share all resident cells. Allow two extra pools per sequence for rebasing.
 uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs = 1);
 
 // select_k of Glm5NextTextIndexer.forward: must run over POOLS, a cell cut takes partial pools
@@ -55,6 +55,8 @@ public:
     ~llm_graph_input_kpool() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]

@@ -147,6 +147,19 @@ try {
     Invoke-Logged 'qsa-runtime' $QsaExe @()
     Get-Content -LiteralPath (Join-Path $LogDir 'qsa-runtime.log') | Out-Host
 
+    $KpoolSource = Get-Content (Join-Path $RepoRoot 'src/llama-kv-cache-kpool.cpp') -Raw
+    $KpoolStart = $KpoolSource.IndexOf('uint32_t llama_kpool_n_pools(')
+    if ($KpoolStart -lt 0) { throw 'K-pool test extraction needs review after an upstream change.' }
+    Set-Content -LiteralPath (Join-Path $LogDir 'kpool-input-test.inc') -Value $KpoolSource.Substring($KpoolStart) -Encoding ascii
+    $KpoolExe = Join-Path $LogDir 'test-kpool.exe'
+    Invoke-Logged 'kpool-build' (Join-Path $RocmPath 'lib/llvm/bin/clang++.exe') @(
+        '-std=c++17', '-O2', '-fms-runtime-lib=dll', '-DGGML_SHARED',
+        '-Isrc', '-Iinclude', '-Iggml/include', "-I$LogDir", 'scripts/windows-kpool.cpp',
+        (Join-Path $BuildDir 'ggml/src/ggml-base.lib'), '-o', $KpoolExe
+    )
+    Invoke-Logged 'kpool-runtime' $KpoolExe @()
+    Get-Content -LiteralPath (Join-Path $LogDir 'kpool-runtime.log') | Out-Host
+
     if ($SkipGpu) {
         Write-Warning 'GPU checks skipped; this is a partial validation.'
     } else {

@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
+#include "llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +13,7 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
     GGML_ASSERT(kpool > 0);
     GGML_ASSERT(n_seqs > 0);
 
-    return n_kv/kpool + 2*n_seqs;
+    return (n_kv/kpool + 2)*n_seqs;
 }
 
 uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool) {
@@ -228,8 +229,7 @@ void llama_kv_cache_set_input_kpool(
             kpool_mask_fill((float *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
         }
 
-        // [TAG_KPOOL_PACK] one packed run per sequence, NOT one full-width table: the indexer
-        // scores every slot against every query, which would multiply the score tensor by n_seq_max
+        // Shared cells need a pool entry in each sequence's run.
         {
             int64_t n_want = 0;
 
@@ -255,14 +255,7 @@ void llama_kv_cache_set_input_kpool(
                 n_want += run_len[ps];
             }
 
-            if (n_want > n_pools) {
-                int64_t rem = n_pools;
-
-                for (int64_t ps = 0; ps < n_ps; ++ps) {
-                    run_len[ps] = std::min(run_len[ps], rem/(n_ps - ps));
-                    rem -= run_len[ps];
-                }
-            }
+            GGML_ASSERT(n_want <= n_pools && "k-pool: pool table cannot hold all sequence runs");
 
             int64_t off = 0;
             for (int64_t ps = 0; ps < n_ps; ++ps) {
@@ -490,4 +483,46 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
     if (rebuild) {
         mctx_attn->get_kv()->clear_kpool_dirty();
     }
+}
+
+bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+
+    mctx_attn = mctx->get_attn();
+    mctx_idx  = mctx->get_idx();
+
+    if (mctx_idx == nullptr || k_idxs->ne[0] != params.ubatch.n_tokens) {
+        return false;
+    }
+
+    if (pool_cells == nullptr) {
+        return true;
+    }
+
+    const int64_t n_kv     = mctx_attn->get_n_kv();
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+
+    if (n_stream == 0 || params.ubatch.n_tokens % n_stream != 0 || params.ubatch.n_seqs_unq == 0) {
+        return false;
+    }
+
+    const int64_t n_tps   = params.ubatch.n_tokens/n_stream;
+    const int64_t n_ps    = params.ubatch.n_seqs_unq/n_stream;
+    const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
+    const bool dirty     = mctx_attn->get_kv()->get_kpool_dirty();
+
+    bool res = true;
+
+    res &= pool_cells->ne[0] == kpool*n_pools;
+    res &= pool_cells->ne[1] == n_stream;
+    res &= pool_bias->ne[0]  == n_pools;
+    res &= pool_bias->ne[1]  == n_tps;
+    res &= pool_bias->ne[2]  == n_stream;
+    res &= sel_mask->ne[0]   == n_kv;
+    res &= sel_mask->ne[1]   == n_tps;
+    res &= sel_mask->ne[3]   == n_stream;
+    res &= n_new_max == (dirty ? n_pools : n_tps/kpool + n_ps);
+    res &= rebuild == dirty;
+
+    return res;
 }
