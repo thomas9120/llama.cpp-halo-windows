@@ -34,7 +34,9 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
 3. Grouped decode matvecs (`GGML_CUDA_DISABLE_MMV_GROUP` in
    `ggml-cuda.cu`). Consecutive single-column matvecs sharing one
    activation (gate/up pairs, HC projs) launch as one kernel.
-   DEFERRED (needs ggml-cuda.cu fusion + mmvq.cuh group API).
+   PORTED (needs the FQ core below; commit `27f4573c9`).
+   Fused-quantize core (`mul_mat_vec_q_fq_*`, `fq_try` entry hook,
+   prologue API): PORTED (commit `ec359ce3d`).
 4. GDN decode fusion (`GGML_CUDA_DISABLE_GDN_GATE`). Whole
    conv->norm->gate->recurrence->state-copy chain as one kernel, plus
    DPP reductions and 16/32-warp configs in `gated_delta_net.cu`.
@@ -50,7 +52,9 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
    routing fixes. DEFERRED.
 8. MMQ tile tuning (`mmq-config-rdna3-5.cuh`, `mmq.cuh` prefetch,
    `mmq-vec-dot.cuh` split-j). Mostly prefill/spec-verify.
-   DEFERRED.
+   PORTED (commit `ba40f6862`). Kept the local 512-expert compact
+   MoE selection; halo's 256-expert routed-compact selection,
+   swiglu/pair decls, and whitespace-only hunks stay deferred.
 9. Compact MUL_MAT_ID 512x10 (`mmid.cu`). Spec-verify win.
    DEFERRED.
 10. hyperconn vs hc-*: halo renamed `hc-cn/mix.cu` to `hyperconn.*`
@@ -61,14 +65,13 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
 
 Also deferred from inside the ported files (same files, later steps):
 
-* `mmvq.cu`: fused-quantize section (`MMVQ_FQ_*`), `MMV_GROUP`
-  section, `mul_mat_vec_q_fq_try` public-entry hook,
-  `*_weighted_rdna3_5` kernels, IQ3_S rows/grid/LDS probe kernels +
-  case-1 dispatch (`GGML_IQ3_ROWS/LDS/GRID`, ncols_x==2560 only),
-  `ggml-backend-impl.h` include, `moe_launch` IQ4_NL rpb change
-  (kept local rpb=4: halo's removal assumes their FQ path).
+* `mmvq.cu`: IQ3_S rows/grid/LDS probe kernels + case-1 dispatch
+  (`GGML_IQ3_ROWS/LDS/GRID`, ncols_x==2560 only), `moe_launch`
+  IQ4_NL rpb change (kept local rpb=4), gdn_gate + weighted MoE
+  kernels, `mul_mat_q_pair` decl.
 * `mmvf.cu`: `tokens_in_block` plumbing (grouped path), `exact_batch`
   / `GGML_HINT_EXACT_BATCH` plumbing (absent locally).
+* `common.cuh`: hipCUB enable (QSA top-k beyond 2k tokens).
 * `vecdotq.cuh`: fully in sync with halo after this commit.
 
 ## This commit
