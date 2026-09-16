@@ -1710,7 +1710,274 @@ static void mul_mat_vec_q_fq_switch_type(
 }
 
 // ---------------------------------------------------------------------------------------------
+// RDNA3.5 grouped single-column matvec: several independent matvecs that share the same activation vector
+// Q8_0 matvecs are launched as one kernel. Each segment is a plain [ncols x nrows] weight matrix with an optional
+// Q8_0 gate and GLU epilogue. Blocks are assigned to segments by a prefix over the segment block counts.
 
+#define MMVQ_GROUP_MAX 4
+
+struct mmvq_group_seg_dev {
+    const void * vx;
+    const void * gate;
+    float      * dst;
+    int          nrows;
+    int          stride_row;      // in Q8_0 blocks
+    int          gate_stride_row; // in blocks
+    int          blocks_begin;
+    int          glu_op;
+    float        glu_limit;
+};
+
+struct mmvq_group_args_dev {
+    mmvq_group_seg_dev seg[MMVQ_GROUP_MAX];
+    int nseg;
+};
+
+template <int nwarps, int pf>
+__launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_fq_group(
+        const mmvq_group_args_dev args, const float * GGML_CUDA_RESTRICT y_ptr, const int ncols_x,
+        const float y_scale, const float y_bias, const int y_op) {
+    constexpr int qk  = QK8_0;
+    constexpr int qi  = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    extern __shared__ char mmvq_fq_smem[];
+    block_q8_1 * y_q8 = (block_q8_1 *) mmvq_fq_smem;
+
+    const int lane = threadIdx.x;
+    const int tid  = warp_size*threadIdx.y + lane;
+
+    // segment lookup, uniform per block
+    int s = 0;
+#pragma unroll
+    for (int k = 1; k < MMVQ_GROUP_MAX; ++k) {
+        if (k < args.nseg && (int) blockIdx.x >= args.seg[k].blocks_begin) {
+            s = k;
+        }
+    }
+    const mmvq_group_seg_dev seg = args.seg[s];
+
+    const int  row    = ((int) blockIdx.x - seg.blocks_begin)*nwarps + threadIdx.y;
+    const bool row_ok = row < seg.nrows;
+
+    // Q8_0 path: identical to mul_mat_vec_q_fq<GGML_TYPE_Q8_0, ...>
+    const int  row_safe = row_ok ? row : seg.nrows - 1;
+    const bool use_gate = seg.gate != nullptr;
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const int kqs  = vdr * (lane % (qi/vdr));
+    const int kbx0 = lane / (qi/vdr);
+
+    const block_q8_0 * x  = (const block_q8_0 *) seg.vx + (size_t) row_safe*seg.stride_row;
+    const block_q8_0 * xg = use_gate ? (const block_q8_0 *) seg.gate + (size_t) row_safe*seg.gate_stride_row : nullptr;
+
+    mmvq_fq_q8_0_chunk<pf> cx;
+    mmvq_fq_q8_0_chunk<pf> cg;
+    mmvq_fq_q8_0_load(cx, x, kbx0, kqs, blocks_per_row_x);
+    if (use_gate) {
+        mmvq_fq_q8_0_load(cg, xg, kbx0, kqs, blocks_per_row_x);
+    }
+
+    {
+        const float * y = y_ptr;
+        const int nby = ncols_x / QK8_1;
+        for (int i = tid; i < 4*nby; i += nwarps*warp_size) {
+            const int ib  = i >> 2;
+            const int sub = i & 3;
+            const float4 * yv = (const float4 *) (y + ib*QK8_1 + sub*8);
+            const float4 v0 = yv[0];
+            const float4 v1 = yv[1];
+            float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            if (y_op != 0) {
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const float t = y_scale * v[k] + y_bias;
+                    v[k] = y_op == 1 ? ggml_cuda_op_silu_single(t) : 1.0f / (1.0f + expf(-t));
+                }
+            }
+
+            float amax = fabsf(v[0]);
+#pragma unroll
+            for (int k = 1; k < 8; ++k) {
+                amax = fmaxf(amax, fabsf(v[k]));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+
+            const float d = amax / 127.0f;
+            int q[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int8_t qk8 = amax == 0.0f ? 0 : roundf(v[k] / d);
+                q[k] = (int) qk8 & 0xff;
+            }
+            int * qs = (int *) y_q8[ib].qs;
+            qs[2*sub + 0] = q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24);
+            qs[2*sub + 1] = q[4] | (q[5] << 8) | (q[6] << 16) | (q[7] << 24);
+            if (sub == 0) {
+                y_q8[ib].ds = make_half2(d, 0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (!row_ok) {
+        return;
+    }
+
+    float tmp      = 0.0f;
+    float tmp_gate = 0.0f;
+
+    const block_q8_1 * y = y_q8;
+    constexpr int chunk_blocks = pf*blocks_per_iter;
+    for (int c0 = kbx0; c0 < blocks_per_row_x; c0 += chunk_blocks) {
+        mmvq_fq_q8_0_chunk<pf> nx;
+        mmvq_fq_q8_0_chunk<pf> ng;
+        const int c1 = c0 + chunk_blocks;
+        if (c1 < blocks_per_row_x) {
+            mmvq_fq_q8_0_load(nx, x, c1, kqs, blocks_per_row_x);
+            if (use_gate) {
+                mmvq_fq_q8_0_load(ng, xg, c1, kqs, blocks_per_row_x);
+            }
+        }
+        mmvq_fq_q8_0_dot(tmp, cx, y, c0, kqs, blocks_per_row_x);
+        if (use_gate) {
+            mmvq_fq_q8_0_dot(tmp_gate, cg, y, c0, kqs, blocks_per_row_x);
+        }
+        if (c1 < blocks_per_row_x) {
+            cx = nx;
+            if (use_gate) {
+                cg = ng;
+            }
+        }
+    }
+
+    tmp = warp_reduce_sum<warp_size>(tmp);
+    if (use_gate) {
+        tmp_gate = warp_reduce_sum<warp_size>(tmp_gate);
+    }
+
+    if (lane == 0) {
+        float result = tmp;
+        if (use_gate) {
+            switch (seg.glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(tmp_gate);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(tmp_gate);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(tmp_gate, result);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    result = ggml_cuda_op_swiglu_clamp_single(tmp_gate, result, seg.glu_limit);
+                    break;
+                default:
+                    result = result * tmp_gate;
+                    break;
+            }
+        }
+        seg.dst[row] = result;
+    }
+}
+
+bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return false;
+    }
+    if (y->type != GGML_TYPE_F32 || y->ne[1] != 1 || y->ne[2] != 1 || y->ne[3] != 1 || !ggml_is_contiguous(y) ||
+            (uintptr_t) y->data % 16 != 0 || y->ne[0] != w->ne[0]) {
+        return false;
+    }
+    if (w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != ggml_type_size(w->type) || w->ne[1] > INT32_MAX ||
+            (w->buffer && ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE)) {
+        return false;
+    }
+    const int64_t ncols = w->ne[0];
+    if (w->type == GGML_TYPE_Q8_0) {
+        return ncols % QK8_1 == 0 && (ncols / QK8_1) * sizeof(block_q8_1) <= 16384 && w->nb[1] % sizeof(block_q8_0) == 0;
+    }
+    return false;
+}
+
+void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, const int nseg) {
+    GGML_ASSERT(nseg >= 1 && nseg <= MMVQ_GROUP_MAX);
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const int nsm       = ggml_cuda_info().devices[device].nsm;
+    GGML_ASSERT(warp_size == 32);
+
+    const int ncols = y->ne[0];
+
+    int64_t total_q8_rows = 0;
+    int64_t max_rows      = 0;
+    for (int i = 0; i < nseg; ++i) {
+        GGML_ASSERT(ggml_cuda_mmv_group_seg_ok(segs[i].w, y));
+        GGML_ASSERT(segs[i].dst->type == GGML_TYPE_F32 && ggml_is_contiguous(segs[i].dst) && ggml_nelements(segs[i].dst) == segs[i].w->ne[1]);
+        if (segs[i].gate) {
+            GGML_ASSERT(segs[i].w->type == GGML_TYPE_Q8_0 && segs[i].gate->type == GGML_TYPE_Q8_0 &&
+                ggml_are_same_shape(segs[i].w, segs[i].gate) && segs[i].gate->nb[0] == sizeof(block_q8_0) &&
+                segs[i].gate->nb[1] % sizeof(block_q8_0) == 0);
+        }
+        total_q8_rows += segs[i].w->ne[1];
+        max_rows = std::max<int64_t>(max_rows, segs[i].w->ne[1]);
+    }
+
+    // same block-size heuristic as mul_mat_vec_q_fq_launch, applied to the largest segment
+    int nwarps = MMVQ_FQ_NWARPS;
+    while (nwarps > 4 && ((max_rows + nwarps - 1) / nwarps) < 2 * nsm) {
+        nwarps /= 2;
+    }
+
+    mmvq_group_args_dev args{};
+    args.nseg = nseg;
+    int nblocks = 0;
+    for (int i = 0; i < nseg; ++i) {
+        mmvq_group_seg_dev & d = args.seg[i];
+        const ggml_tensor * w = segs[i].w;
+        d.vx           = w->data;
+        d.gate         = segs[i].gate ? segs[i].gate->data : nullptr;
+        d.dst          = (float *) segs[i].dst->data;
+        d.nrows        = (int) w->ne[1];
+        d.stride_row   = (int) (w->nb[1] / ggml_type_size(w->type));
+        d.gate_stride_row = segs[i].gate ? (int) (segs[i].gate->nb[1] / sizeof(block_q8_0)) : 0;
+        d.blocks_begin = nblocks;
+        d.glu_op       = (int) segs[i].glu_op;
+        d.glu_limit    = segs[i].glu_limit;
+        nblocks += (d.nrows + nwarps - 1) / nwarps;
+    }
+
+    const dim3 block_nums(nblocks, 1, 1);
+    const dim3 block_dims(warp_size, nwarps, 1);
+    const int  nbytes_shared = total_q8_rows > 0 ? (ncols / QK8_1) * sizeof(block_q8_1) : 0;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, ctx.stream());
+
+    constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
+    const bool long_rows = (ncols / QK8_0) >= 16 * blocks_per_iter && total_q8_rows <= 1024;
+
+    auto launch = [&](auto kernel) {
+        ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, 1.0f, 0.0f, 0);
+    };
+
+    switch (nwarps) {
+        case 16: launch(mul_mat_vec_fq_group<16, MMVQ_FQ_PF>); break;
+        case 8:
+            if (long_rows) { launch(mul_mat_vec_fq_group<8, MMVQ_FQ_PF_LONG>); }
+            else           { launch(mul_mat_vec_fq_group<8, MMVQ_FQ_PF>); }
+            break;
+        case 4:
+            if (long_rows) { launch(mul_mat_vec_fq_group<4, MMVQ_FQ_PF_LONG>); }
+            else           { launch(mul_mat_vec_fq_group<4, MMVQ_FQ_PF>); }
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
 
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)

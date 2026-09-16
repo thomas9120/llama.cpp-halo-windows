@@ -3850,6 +3850,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (count > 0) { ggml_cuda_op_idx_relu_sum(*cuda_ctx, args); return count - 1; }
     }
 
+    // RDNA3.5 decode: consecutive single-column MUL_MATs that read the same activation vector (plain Q8_0/F32
+    // matvecs, or a [mul_mat, mul_mat, glu] gate/up pair) are launched as one grouped kernel. The segments are
+    // mutually independent, so the launch position of the first one is valid for all of them.
+    if (getenv("GGML_CUDA_DISABLE_MMV_GROUP") == nullptr &&
+            node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && ggml_cuda_mmv_group_seg_ok(node->src[0], node->src[1])) {
+        const ggml_tensor * y = node->src[1];
+        ggml_cuda_mmv_group_seg segs[GGML_CUDA_MMV_GROUP_MAX];
+        int out_nodes[GGML_CUDA_MMV_GROUP_MAX];
+        int nseg  = 0;
+        int j     = i;
+        int j_end = i; // index of the last node that belongs to the group
+        while (j < cgraph->n_nodes && nseg < GGML_CUDA_MMV_GROUP_MAX) {
+            ggml_tensor * n = cgraph->nodes[j];
+            if (j > i && ggml_cuda_is_view_or_noop(n)) {
+                j++;
+                continue;
+            }
+            const bool is_mmv = n->op == GGML_OP_MUL_MAT && n->src[2] == nullptr && n->src[1] == y &&
+                (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && n->type == GGML_TYPE_F32 && ggml_is_contiguous(n) &&
+                ggml_cuda_mmv_group_seg_ok(n->src[0], y);
+            if (!is_mmv) {
+                break;
+            }
+            // gate/up pair followed by the GLU that combines them
+            if (j + 2 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT && cgraph->nodes[j + 2]->op == GGML_OP_GLU) {
+                ggml_tensor * n2  = cgraph->nodes[j + 1];
+                ggml_tensor * glu = cgraph->nodes[j + 2];
+                ggml_tensor * gate_n = nullptr;
+                ggml_tensor * up_n   = nullptr;
+                if (glu->src[0] == n && glu->src[1] == n2) {
+                    gate_n = n;
+                    up_n   = n2;
+                } else if (glu->src[0] == n2 && glu->src[1] == n) {
+                    gate_n = n2;
+                    up_n   = n;
+                }
+                if (gate_n && n2->src[2] == nullptr && n2->src[1] == y && (n2->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                        up_n->src[0]->type == GGML_TYPE_Q8_0 && gate_n->src[0]->type == GGML_TYPE_Q8_0 &&
+                        ggml_are_same_shape(up_n->src[0], gate_n->src[0]) && ggml_cuda_mmv_group_seg_ok(n2->src[0], y) &&
+                        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == up_n->src[0]->ne[1] &&
+                        ggml_cuda_should_fuse_mul_mat(up_n, gate_n, glu) &&
+                        ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { j + 2 })) {
+                    segs[nseg].w         = up_n->src[0];
+                    segs[nseg].gate      = gate_n->src[0];
+                    segs[nseg].dst       = glu;
+                    segs[nseg].glu_op    = ggml_get_glu_op(glu);
+                    segs[nseg].glu_limit = ggml_get_op_params_f32(glu, 3);
+                    out_nodes[nseg++] = j + 2;
+                    j_end = j + 2;
+                    j += 3;
+                    continue;
+                }
+            }
+            segs[nseg].w   = n->src[0];
+            segs[nseg].dst = n;
+            out_nodes[nseg++] = j;
+            j_end = j;
+            j++;
+        }
+        if (nseg >= 2 && ggml_cuda_check_fusion_memory_ranges(cgraph, i, j_end - i + 1, out_nodes, nseg)) {
+            ggml_cuda_mmv_group(*cuda_ctx, y, segs, nseg);
+            return j_end - i;
+        }
+    }
+
     if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_hc_mix_args args;
         const int count=ggml_cuda_hc_mix_closed(cgraph,i,args);
