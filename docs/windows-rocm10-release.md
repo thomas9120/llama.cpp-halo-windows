@@ -14,7 +14,7 @@ The workflow creates the tag at the selected run's exact commit and publishes th
 
 ## ZIP contents
 
-- `bin/llama-server.exe`, `llama-cli.exe`, `llama-bench.exe`, and `llama-fit-params.exe`.
+- `bin/llama-server.exe`, `llama-cli.exe`, `llama-bench.exe`, `llama-fit-params.exe`, and `llama-perplexity.exe`.
 - llama.cpp DLLs, Visual C++ runtime DLLs, and the required ROCm runtime libraries.
 - rocBLAS/hipBLASLt kernel data, `.kpack` data, licenses, and a README recording the source commit.
 

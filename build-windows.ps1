@@ -64,7 +64,7 @@ if ($ConfigureOnly) {
     return
 }
 
-cmake --build $BuildDir --target llama-server llama-cli llama-bench llama-fit-params --parallel $Jobs
+cmake --build $BuildDir --target llama-server llama-cli llama-bench llama-fit-params llama-perplexity --parallel $Jobs
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
 }
