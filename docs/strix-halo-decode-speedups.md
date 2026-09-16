@@ -43,7 +43,9 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
    DEFERRED.
 5. MoE decode fusion (`GGML_CUDA_DISABLE_WEIGHTED_DOWN`). Fused
    routing + weighted expert reduction + shared-expert gate.
-   DEFERRED.
+   PARTLY PORTED: one-token IQ4_NL/Q8_0 down-proj + weighted sum
+   (commit below). Shared-expert merge stays in the local
+   moe-weighted-reduction path.
 6. Fused activation quantization (`quantize_mmq_q8_1_swiglu` in
    `quantize.cu`). SiLU(gate)*up fused into the Q8_1 quantize.
    DEFERRED.

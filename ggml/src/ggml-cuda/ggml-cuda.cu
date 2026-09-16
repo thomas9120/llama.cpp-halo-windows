@@ -3798,6 +3798,17 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count;
 }
 
+// true when the BF16 WMMA GEMM would take this MUL_MAT / MUL_MAT_ID, so MMQ-based fusions leave it alone
+static bool ggml_cuda_mmb_claims(const ggml_tensor * t) {
+    if (!t || !t->src[0] || !t->src[1]) {
+        return false;
+    }
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        return t->src[2] && ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t);
+    }
+    return t->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4080,6 +4091,50 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // qwen4exp IQ4_NL routed down projection followed by the 10-expert weighted sum. Compute all selected
+    // experts for one output row in a wave and apply their routing weights immediately, avoiding the
+    // [n_embd, n_used] intermediate and its separate reduction launch.
+    if (getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") == nullptr &&
+            node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+            !ggml_cuda_mmb_claims(node)) {
+        constexpr int n_used = 10;
+        constexpr int n_ops  = 2 + n_used + (n_used - 1);
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+        const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
+        const int output_idx = i + n_ops - 1;
+        ggml_tensor * output = cgraph->nodes[output_idx];
+        bool valid = experts == node && node->ne[1] == n_used &&
+            ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(experts, weights, output);
+
+        for (int j = 0; valid && j < n_used; ++j) {
+            const ggml_tensor * view = cgraph->nodes[i + 2 + j];
+            valid = view->op == GGML_OP_VIEW && view->src[0] == mul &&
+                view->ne[0] == mul->ne[0] && view->ne[1] == mul->ne[2] && view->ne[2] == 1 && view->ne[3] == 1 &&
+                view->nb[0] == sizeof(float) && view->nb[1] == mul->nb[2] && view->view_offs == size_t(j) * mul->nb[1];
+        }
+        const int add_start = i + 2 + n_used;
+        if (valid) {
+            const ggml_tensor * first = cgraph->nodes[add_start];
+            valid = first->op == GGML_OP_ADD && first->src[0] == cgraph->nodes[i + 2] && first->src[1] == cgraph->nodes[i + 3];
+        }
+        for (int j = 2; valid && j < n_used; ++j) {
+            const ggml_tensor * add = cgraph->nodes[add_start + j - 1];
+            valid = add->op == GGML_OP_ADD && add->src[0] == cgraph->nodes[add_start + j - 2] && add->src[1] == cgraph->nodes[i + 2 + j];
+        }
+        if (valid) {
+            std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+            ops.insert(ops.end(), n_used, GGML_OP_VIEW);
+            ops.insert(ops.end(), n_used - 1, GGML_OP_ADD);
+            const int out_nodes[] = { output_idx };
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), out_nodes, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+                ggml_cuda_mul_mat_id_weighted_rdna3_5(*cuda_ctx, experts, weights, output);
+                return n_ops - 1;
+            }
         }
     }
 

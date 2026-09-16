@@ -2697,6 +2697,150 @@ void ggml_cuda_mul_mat_vec_q_fq_prologue(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ASSERT(ok);
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) {
+    float result;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+
+static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) {
+    float result;
+    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+#else
+static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
+static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
+#endif
+
+template <int n_expert_used>
+__launch_bounds__(32, 8)
+static __global__ void mul_mat_id_iq4_nl_weighted_rdna3_5(
+        const void * vx_ptr, const block_q8_1 * y, const int32_t * ids, const float * weights, float * dst,
+        const int nrows, const int blocks_per_row, const int stride_row_x, const int stride_channel_x,
+        const int stride_y) {
+    constexpr int qi        = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qi;
+    constexpr int vdr       = VDR_Q4_0_Q8_1_MMVQ;
+    constexpr int warp_size = 32;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    float result = 0.0f;
+#pragma unroll
+    for (int ex = 0; ex < n_expert_used; ++ex) {
+        const int channel = ids[ex];
+        const int x_off = channel * stride_channel_x + row * stride_row_x;
+        float sum = 0.0f;
+        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+            const int kqs = vdr * (lane % (qi/vdr));
+            sum += vec_dot_iq4_nl_q8_1(vx_ptr, y + ex * stride_y + kbx, x_off + kbx, kqs);
+        }
+        sum = warp_reduce_sum<warp_size>(sum);
+        const float term = mmvq_hc_mul_rn(sum, weights[ex]);
+        result = ex == 0 ? term : mmvq_hc_add_rn(result, term);
+    }
+
+    if (lane == 0) {
+        dst[row] = result;
+    }
+}
+
+template <int n_expert_used>
+__launch_bounds__(32, 8)
+static __global__ void mul_mat_id_q8_0_weighted_rdna3_5(
+        const void * vx_ptr, const block_q8_1 * y, const int32_t * ids, const float * weights, float * dst,
+        const int nrows, const int blocks_per_row, const int stride_row_x, const int stride_channel_x,
+        const int stride_y) {
+    constexpr int qi        = QI8_0;
+    constexpr int vdr       = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int warp_size = 32;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    float result = 0.0f;
+#pragma unroll
+    for (int ex = 0; ex < n_expert_used; ++ex) {
+        const int channel = ids[ex];
+        const int x_off = channel * stride_channel_x + row * stride_row_x;
+        float sum = 0.0f;
+        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+            const int kqs = vdr * (lane % (qi/vdr));
+            sum += vec_dot_q8_0_q8_1(vx_ptr, y + ex * stride_y + kbx, x_off + kbx, kqs);
+        }
+        sum = warp_reduce_sum<warp_size>(sum);
+        const float term = mmvq_hc_mul_rn(sum, weights[ex]);
+        result = ex == 0 ? term : mmvq_hc_add_rn(result, term);
+    }
+
+    if (lane == 0) {
+        dst[row] = result;
+    }
+}
+
+bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(
+        const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst) {
+    if (experts->op != GGML_OP_MUL_MAT_ID ||
+            (experts->src[0]->type != GGML_TYPE_IQ4_NL && experts->src[0]->type != GGML_TYPE_Q8_0) ||
+            experts->src[1]->type != GGML_TYPE_F32 || experts->src[2]->type != GGML_TYPE_I32 ||
+            experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * w   = experts->src[0];
+    const ggml_tensor * y   = experts->src[1];
+    const ggml_tensor * ids = experts->src[2];
+    const int64_t n_used = ids->ne[0];
+    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+        n_used == 10 && w->ne[0] == 640 && w->ne[1] == 2560 && w->ne[2] == 512 && w->ne[3] == 1 &&
+        y->ne[0] == 640 && ggml_nelements(y) == 640 * n_used && ggml_is_contiguous(y) &&
+        ggml_nelements(ids) == n_used && ggml_is_contiguous(ids) &&
+        weights->ne[0] == 1 && weights->ne[1] == n_used && ggml_nelements(weights) == n_used && ggml_is_contiguous(weights) &&
+        ggml_nelements(experts) == 2560 * n_used && ggml_is_contiguous(experts) &&
+        ggml_nelements(dst) == 2560 && ggml_is_contiguous(dst);
+}
+
+void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(experts, weights, dst));
+    const ggml_tensor * w   = experts->src[0];
+    const ggml_tensor * y   = experts->src[1];
+    const ggml_tensor * ids = experts->src[2];
+    constexpr int n_used = 10;
+    constexpr int ncols  = 640;
+    constexpr int nrows  = 2560;
+    constexpr int nblocks = ncols / QK8_1;
+
+    ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), n_used * nblocks);
+    quantize_row_q8_1_cuda(
+        (const float *) y->data, nullptr, y_q8.get(), w->type,
+        ncols,
+        y->nb[1] / sizeof(float), y->nb[2] / sizeof(float), y->nb[3] / sizeof(float),
+        y->ne[0], y->ne[1], y->ne[2], y->ne[3], ctx.stream());
+
+    const ggml_cuda_kernel_launch_params params(nrows, 32, 0, ctx.stream());
+    if (w->type == GGML_TYPE_IQ4_NL) {
+        ggml_cuda_kernel_launch(mul_mat_id_iq4_nl_weighted_rdna3_5<n_used>, params,
+            w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
+            nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
+            (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_id_q8_0_weighted_rdna3_5<n_used>, params,
+            w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
+            nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
+            (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
