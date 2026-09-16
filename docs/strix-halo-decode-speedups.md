@@ -1,0 +1,102 @@
+# Strix Halo decode speedups (halo-box/strix-llama.cpp)
+
+Target: gfx1151 only, ROCm/HIP path. Decode = batch-1 token generation
+for qwen4exp (Qwen3.8-Flash-Next: GDN + MoE 512x10 + hyper-connections +
+QSA sparse attention + PLE).
+
+## Baseline comparison
+
+Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
+("pwilkin/strix-halo official merge (#63)", 2026-09):
+
+* `git diff HEAD 0636c9ae -- ggml/src/ggml-cuda`: +7246/-2797, 65 files
+* Local already has the pwilkin/strix-halo base (#1): `mmb.cu`,
+  `qsa.cu`, `hc-cn/mix.cu`, `ple-conv.cu`, `gdn-conv.cu`,
+  `norm-gated.cu`, older `gated_delta_net.cu`.
+* Missing locally: all of halo's later HIP decode work listed below.
+* Do NOT blindly sync `src/`: halo deleted `llama-kv-cache-kpool.*`,
+  `llama-lazy-reader.h`, `glm5next.cpp` in favor of `ple-disk` and
+  different KV handling. Port `ggml-cuda` kernels plus minimal hooks.
+* Do NOT port `top-k.cu`: local radix top-k (1049 lines) is ahead of
+  halo (341 lines). Keep it.
+
+## Ranked findings for qwen4exp decode
+
+1. MMVQ RDNA3.5 kernels (`mmvq.cu` +2006 in halo). Dedicated
+   `MMVQ_PARAMETERS_RDNA3_5` table (`calc_nwarps = 1`),
+   `mul_mat_vec_q4_columns*` doing 4 columns per thread for
+   Q1_0/Q2_0/Q5_1/Q4_K/Q5_K/Q6_K/IQ3_S and Q8_0. Decode is almost
+   entirely MMVQ at batch 1. PORTED (this commit, core only).
+2. MMVF single-column work (`mmvf.cu` +223). 4x software-prefetch K
+   loop for ncols_dst==1 f32 matvecs (MoE routers, HC projs,
+   bit-identical) + `mul_mat_vec_bf16_wave` for K<=512 BF16 rows
+   (93 -> 67 us on 8x2048 K=512 per halo comment). PORTED.
+3. Grouped decode matvecs (`GGML_CUDA_DISABLE_MMV_GROUP` in
+   `ggml-cuda.cu`). Consecutive single-column matvecs sharing one
+   activation (gate/up pairs, HC projs) launch as one kernel.
+   DEFERRED (needs ggml-cuda.cu fusion + mmvq.cuh group API).
+4. GDN decode fusion (`GGML_CUDA_DISABLE_GDN_GATE`). Whole
+   conv->norm->gate->recurrence->state-copy chain as one kernel, plus
+   DPP reductions and 16/32-warp configs in `gated_delta_net.cu`.
+   DEFERRED.
+5. MoE decode fusion (`GGML_CUDA_DISABLE_WEIGHTED_DOWN`). Fused
+   routing + weighted expert reduction + shared-expert gate.
+   DEFERRED.
+6. Fused activation quantization (`quantize_mmq_q8_1_swiglu` in
+   `quantize.cu`). SiLU(gate)*up fused into the Q8_1 quantize.
+   DEFERRED.
+7. Flash-attention decode (`fattn.cu` + new `fattn-tile-rdna3-5.cu`).
+   Q8_0 KV tile decode path (D=64/128/256, GQA>=2) + WMMA D=256
+   routing fixes. DEFERRED.
+8. MMQ tile tuning (`mmq-config-rdna3-5.cuh`, `mmq.cuh` prefetch,
+   `mmq-vec-dot.cuh` split-j). Mostly prefill/spec-verify.
+   DEFERRED.
+9. Compact MUL_MAT_ID 512x10 (`mmid.cu`). Spec-verify win.
+   DEFERRED.
+10. hyperconn vs hc-*: halo renamed `hc-cn/mix.cu` to `hyperconn.*`
+    with BF16-only streams + `mmb_enabled()` gated to RDNA3.5.
+    Reconcile with the Windows build before touching. DEFERRED.
+11. QSA split (`qsa.cu` -> `qsa-decode.cu` + `qsa-prefill.cu`).
+    Needed only when porting the FATTN routing. DEFERRED.
+
+Also deferred from inside the ported files (same files, later steps):
+
+* `mmvq.cu`: fused-quantize section (`MMVQ_FQ_*`), `MMV_GROUP`
+  section, `mul_mat_vec_q_fq_try` public-entry hook,
+  `*_weighted_rdna3_5` kernels, IQ3_S rows/grid/LDS probe kernels +
+  case-1 dispatch (`GGML_IQ3_ROWS/LDS/GRID`, ncols_x==2560 only),
+  `ggml-backend-impl.h` include, `moe_launch` IQ4_NL rpb change
+  (kept local rpb=4: halo's removal assumes their FQ path).
+* `mmvf.cu`: `tokens_in_block` plumbing (grouped path), `exact_batch`
+  / `GGML_HINT_EXACT_BATCH` plumbing (absent locally).
+* `vecdotq.cuh`: fully in sync with halo after this commit.
+
+## This commit
+
+* `ggml/src/ggml-cuda/mmvq.cu`: RDNA3.5 table split, `calc_nwarps=1`,
+  `q4_columns` kernels + case-4 dispatch, `unroll_q8` removal
+  (superseded by the new dispatch), Q5_1 volatile accumulate
+  (ROCm 7.14 rounding workaround), IQ3_S fused-gate pair dot,
+  generic `warp_reduce_sum` (halo dropped the local DPP special
+  case with the redesign).
+* `ggml/src/ggml-cuda/mmvf.cu`: HIP 4x K-loop prefetch, bf16_wave
+  kernel + dispatch (BF16, ncols_dst==1, no fusion, block 256,
+  K<=512, single sample).
+* `ggml/src/ggml-cuda/vecdotq.cuh`: `vec_dot_iq3_s_q8_1_pair`
+  (bit-identical shared-load pair dot for fused gate/up).
+* Inserted blocks are byte-identical to halo `0636c9ae`; behavior
+  changes are limited to kernel selection on RDNA3.5.
+
+## Verify
+
+Build `build-rocm10-gfx1151` per `build-windows.ps1`, then with the
+same Qwen3.8 quant before/after:
+
+* `llama-bench -p 512 -n 128` (pp + tg)
+* `llama-perplexity` for correctness (watched: Q5_1 rounding,
+  IQ3_S pair path, Q8_0 4-column path)
+* `test-backend-ops` MMVQ cases if available
+
+Suggested order for the deferred items: MMQ config (8) -> FQ (6) ->
+MMV_GROUP (3) -> GDN fused (4) -> WEIGHTED_DOWN (5) -> FATTN tile
+(7) -> MMID_512 (9) -> hyperconn reconcile (10) -> QSA split (11).
