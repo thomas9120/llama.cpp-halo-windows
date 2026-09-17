@@ -1200,6 +1200,7 @@ void launch_fattn(
 
         if constexpr (ncols2 == 3) {
             if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                // cap split-KV fan-out, each extra block adds a partial buffer plus merge work
                 parallel_blocks = std::min(18, ntiles_KV);
             }
         }

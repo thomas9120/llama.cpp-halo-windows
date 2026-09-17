@@ -783,7 +783,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                    dst->src[6] != nullptr, dst->src[7] != nullptr, ggml_get_op_params_i32(dst, 4), ggml_is_contiguous(dst));
     }
 
-
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

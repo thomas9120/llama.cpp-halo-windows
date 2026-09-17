@@ -1,9 +1,6 @@
 #include "qsa-prefill.cuh"
 #if defined(GGML_USE_HIP)
 #include "common.cuh"
-#include "qsa-prefill.cuh"
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 typedef short v16s __attribute__((ext_vector_type(16)));
