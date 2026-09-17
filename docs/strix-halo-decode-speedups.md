@@ -107,6 +107,11 @@ Also deferred from inside the ported files (same files, later steps):
   in-kernel. Nodes now carry null src4/6/7 and p4 == 0, matching
   halo's gate contract for both prefill and decode.
 
+* Divergence from halo: `launch_fattn_tile_case` gates `use_q8_0_KV`
+  on RDNA3.5 like `q8_0_KV_supported()` does. Without it a Q8_0
+  decode on other AMD archs would run the NO_DEVICE_CODE trap.
+  No-op on gfx1151.
+
 ## Verify
 
 Build `build-rocm10-gfx1151` per `build-windows.ps1`, then with the

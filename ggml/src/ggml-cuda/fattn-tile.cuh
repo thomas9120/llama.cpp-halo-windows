@@ -1242,7 +1242,10 @@ static void launch_fattn_tile_case(
     fattn_kernel_t fattn_kernel;
 #ifdef GGML_USE_HIP
     if constexpr (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)) {
-        use_q8_0_KV = dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
+        // match ggml_cuda_fattn_tile_q8_0_KV_supported() in fattn.cu: the Q8_0 KV device code
+        // only exists for RDNA3.5, without this other AMD archs would run the NO_DEVICE_CODE trap below.
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        use_q8_0_KV = GGML_CUDA_CC_IS_RDNA3_5(cc) && dst->src[0]->ne[1] == 1 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0;
         fattn_kernel = use_q8_0_KV
             ? flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, true>
             : flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
