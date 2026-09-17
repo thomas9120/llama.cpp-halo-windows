@@ -93,6 +93,20 @@ Also deferred from inside the ported files (same files, later steps):
 * Inserted blocks are byte-identical to halo `0636c9ae`; behavior
   changes are limited to kernel selection on RDNA3.5.
 
+## Porting notes (halo kernel gates vs local graph/model)
+
+* 2026-09-18: halo's QSA gates require `op_params[4] == 0` (their nodes
+  never set it). Our qwen4exp model wrote the selected-key count there
+  via `set_n_kv_max`, so maskless prefill strips matched no kernel and
+  hit halo's maskless abort in `fattn.cu`. Fixed model-side
+  (`set_n_kv_max(cur, 0)`); the kernels never read p4. Nothing else in
+  the tree reads p4 for these nodes (HIP tile `use_sparse` is always
+  false, the NVIDIA sparse check is compiled out).
+* Follow-up: remove the `qsa_pack_keys/values` pre-pass and the src6/7
+  attaches; halo kernels pack in-kernel, so the pre-pass is dead weight
+  (it still runs). Also lets small masked strips take the decode gate,
+  which rejects attached src6/7.
+
 ## Verify
 
 Build `build-rocm10-gfx1151` per `build-windows.ps1`, then with the

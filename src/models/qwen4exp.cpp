@@ -1404,7 +1404,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             cur->src[5] = indices;
             cur->src[6] = packed_keys;
             cur->src[7] = packed_values;
-            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(indices->ne[0]));
+            // halo QSA kernels pack raw K/V in-kernel and only take nodes with op_params[4] == 0.
+            // The old packed-layout count here made their gates bail, which aborts maskless strips.
+            // src6/src7 stay attached but unused until the pack pre-pass is removed.
+            ggml_flash_attn_ext_set_n_kv_max(cur, 0);
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
