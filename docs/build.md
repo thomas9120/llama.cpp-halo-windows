@@ -402,7 +402,7 @@ On Linux it is possible to use unified memory architecture (UMA) to share main m
 
 ### Windows Strix Halo with TheRock ROCm 10
 
-From a regular PowerShell, run `.\build-windows.ps1` in the repository root. It selects Visual Studio 2022, configures the SDK paths, builds `llama-server`, `llama-cli`, `llama-bench`, and `llama-fit-params`, and copies the OpenMP runtime beside the executables. The defaults are `C:\TheRock\build`, `gfx1151`, 12 parallel jobs, and the `build-rocm10-gfx1151` output directory. Use `-RocmPath`, `-BuildDir`, or `-Jobs` to override these settings, or `-ConfigureOnly` to configure without compiling.
+From a regular PowerShell, run `.\build-windows.ps1` in the repository root. It selects Visual Studio 2022, configures the SDK paths, builds `llama-server`, `llama-cli`, `llama-bench`, `llama-fit-params`, and `llama-perplexity`, and copies the OpenMP runtime beside the executables. The defaults are `C:\TheRock\build`, `gfx1151`, 12 parallel jobs, and the `build-rocm10-gfx1151` output directory. Use `-RocmPath`, `-BuildDir`, or `-Jobs` to override these settings, or `-ConfigureOnly` to configure without compiling.
 
 For `gfx1151` (Radeon 8060S), use a Visual Studio 2022 Developer PowerShell with the x64 toolchain. TheRock Clang 23 conflicts with the MSVC 14.51 math headers from Visual Studio 2026; MSVC 14.44 from Visual Studio 2022 avoids this build error.
 
@@ -418,7 +418,7 @@ cmake -S . -B build-rocm10-gfx1151 -G Ninja -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_C_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang.exe" `
     "-DCMAKE_CXX_COMPILER=$env:HIP_PATH/lib/llvm/bin/clang++.exe" `
     "-DCMAKE_PREFIX_PATH=$env:HIP_PATH" -DGGML_HIP=ON -DGPU_TARGETS=gfx1151
-cmake --build build-rocm10-gfx1151 --target llama-server llama-cli llama-bench llama-fit-params --parallel 12
+cmake --build build-rocm10-gfx1151 --target llama-server llama-cli llama-bench llama-fit-params llama-perplexity --parallel 12
 ```
 
 Executables are in `build-rocm10-gfx1151\bin`. Keep the SDK's `bin` directory on `PATH` when running them. With OpenMP enabled, the Visual Studio runtime `libomp140.x86_64.dll` must also be on `PATH` or beside the executables. Use a fresh build directory when changing the compiler or Visual Studio toolchain.

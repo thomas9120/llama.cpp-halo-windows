@@ -35,3 +35,8 @@ struct ggml_cuda_mmv_group_seg {
 };
 bool ggml_cuda_mmv_group_seg_ok(const ggml_tensor * w, const ggml_tensor * y);
 void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y, const ggml_cuda_mmv_group_seg * segs, int nseg);
+
+// RDNA3.5 one-token IQ4_NL MoE down projection with the selected-expert weighted sum in the kernel epilogue.
+bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);

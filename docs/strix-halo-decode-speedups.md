@@ -43,25 +43,28 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
    DEFERRED.
 5. MoE decode fusion (`GGML_CUDA_DISABLE_WEIGHTED_DOWN`). Fused
    routing + weighted expert reduction + shared-expert gate.
-   DEFERRED.
+   PARTLY PORTED: one-token IQ4_NL/Q8_0 down-proj + weighted sum
+   (commit below). Shared-expert merge stays in the local
+   moe-weighted-reduction path.
 6. Fused activation quantization (`quantize_mmq_q8_1_swiglu` in
    `quantize.cu`). SiLU(gate)*up fused into the Q8_1 quantize.
    DEFERRED.
 7. Flash-attention decode (`fattn.cu` + new `fattn-tile-rdna3-5.cu`).
    Q8_0 KV tile decode path (D=64/128/256, GQA>=2) + WMMA D=256
-   routing fixes. DEFERRED.
+   routing fixes. PORTED (commit `ce215c979`), including the QSA
+   split (item 11) it depends on.
 8. MMQ tile tuning (`mmq-config-rdna3-5.cuh`, `mmq.cuh` prefetch,
    `mmq-vec-dot.cuh` split-j). Mostly prefill/spec-verify.
    PORTED (commit `ba40f6862`). Kept the local 512-expert compact
    MoE selection; halo's 256-expert routed-compact selection,
    swiglu/pair decls, and whitespace-only hunks stay deferred.
 9. Compact MUL_MAT_ID 512x10 (`mmid.cu`). Spec-verify win.
-   DEFERRED.
+   PORTED (commit `19a7318df`); file is now identical to halo.
 10. hyperconn vs hc-*: halo renamed `hc-cn/mix.cu` to `hyperconn.*`
     with BF16-only streams + `mmb_enabled()` gated to RDNA3.5.
     Reconcile with the Windows build before touching. DEFERRED.
 11. QSA split (`qsa.cu` -> `qsa-decode.cu` + `qsa-prefill.cu`).
-    Needed only when porting the FATTN routing. DEFERRED.
+    PORTED as part of item 7 (commit `ce215c979`).
 
 Also deferred from inside the ported files (same files, later steps):
 
@@ -89,6 +92,25 @@ Also deferred from inside the ported files (same files, later steps):
   (bit-identical shared-load pair dot for fused gate/up).
 * Inserted blocks are byte-identical to halo `0636c9ae`; behavior
   changes are limited to kernel selection on RDNA3.5.
+
+## Porting notes (halo kernel gates vs local graph/model)
+
+* 2026-09-18: halo's QSA gates require `op_params[4] == 0` (their nodes
+  never set it). Our qwen4exp model wrote the selected-key count there
+  via `set_n_kv_max`, so maskless prefill strips matched no kernel and
+  hit halo's maskless abort in `fattn.cu`. Fixed model-side
+  (`set_n_kv_max(cur, 0)`); the kernels never read p4. Nothing else in
+  the tree reads p4 for these nodes (HIP tile `use_sparse` is always
+  false, the NVIDIA sparse check is compiled out).
+* Follow-up (done): removed the `qsa_pack_keys/values` pre-pass
+  (`pack.inc` deleted) and the src6/7 attaches; halo kernels pack
+  in-kernel. Nodes now carry null src4/6/7 and p4 == 0, matching
+  halo's gate contract for both prefill and decode.
+
+* Divergence from halo: `launch_fattn_tile_case` gates `use_q8_0_KV`
+  on RDNA3.5 like `q8_0_KV_supported()` does. Without it a Q8_0
+  decode on other AMD archs would run the NO_DEVICE_CODE trap.
+  No-op on gfx1151.
 
 ## Verify
 

@@ -1,4 +1,3 @@
-#include "pack.inc"
 #include "prefix.h"
 #include <vector>
 #include <thread>
@@ -1309,24 +1308,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f && !hparams.attn_soft_cap &&
         shared_qsa!=qsa_inps.end() && shared_qsa->second->maskless;
     const int64_t strip=layout_prefill ? n_tps : qwen4exp_query_strip(n_tps,n_stream);
-    ggml_tensor * packed_keys=nullptr;
-    if (layout_prefill) {
-        auto * original_keys=ggml_permute(ctx0,mctx_cur->get_k(ctx0,il),0,2,1,3);
-        if (original_keys->type==GGML_TYPE_F16 && original_keys->ne[0]==256 && original_keys->ne[1]%4==0 && original_keys->ne[3]==1) {
-            packed_keys=qsa_pack_keys(ctx0,original_keys);
-            ggml_build_forward_expand(gf,packed_keys);
-        }
-    }
-    // QSA attention v2 (qsa-attn/qsa2.cu) consumes V^T fragments straight from a [4 keys][256 dims] block
-    // layout; build it once per graph next to the packed keys when requested.
-    ggml_tensor * packed_values=nullptr;
-    if (layout_prefill) {
-        auto * original_values=ggml_permute(ctx0,mctx_cur->get_v(ctx0,il),0,2,1,3);
-        if (original_values->type==GGML_TYPE_F16 && original_values->ne[0]==256 && original_values->ne[1]%4==0 && original_values->ne[3]==1) {
-            packed_values=qsa_pack_values(ctx0,original_values);
-            ggml_build_forward_expand(gf,packed_values);
-        }
-    }
     std::vector<ggml_tensor *> output;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
@@ -1393,18 +1374,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             const auto qsa_it=qsa_inps.find((uint32_t)hparams.dsv4_compress_ratios[il]);
             // without the mask, top_k is the only record of which cells are visible, and only the qsa3
             // kernel reads it: every other flash-attention path ignores src[5] and would attend to the
-            // whole padded cache. qsa3 needs both packed layouts and bails below 128 queries, so the
-            // mask may only be dropped where those hold - a decode ubatch keeps it.
-            const bool qsa3=packed_keys && packed_values && n_query>=128;
+            // whole padded cache. maskless strips need the halo QSA prefill gate, which wants 128+
+            // queries, so the mask may only be dropped there - a decode ubatch keeps it.
+            const bool qsa3=layout_prefill && n_query>=128;
             const bool maskless=qsa3 && qsa_it!=qsa_inps.end() && qsa_it->second->maskless;
             ggml_tensor * mask = maskless ? nullptr : (ggml_is_contiguous(kq_mask) ? kq_mask : ggml_cont(ctx0, kq_mask));
             ggml_tensor * indices = ggml_is_contiguous(top_k) ? top_k : ggml_cont(ctx0, top_k);
             GGML_ASSERT(indices->ne[1] == kq_mask->ne[1] && indices->ne[3] == kq_mask->ne[3]);
             cur = ggml_flash_attn_ext(ctx0, q_view, k_view, v_view, mask, kq_scale, 0.0f, 0.0f);
             cur->src[5] = indices;
-            cur->src[6] = packed_keys;
-            cur->src[7] = packed_values;
-            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(indices->ne[0]));
+            // halo QSA kernels pack raw K/V in-kernel: src6/src7 must stay null (the decode gate
+            // rejects attached ones) and src4 is unused on this hand-built node.
+            cur->src[4] = nullptr;
+            cur->src[6] = nullptr;
+            cur->src[7] = nullptr;
+            // halo QSA kernels pack raw K/V in-kernel and only take nodes with op_params[4] == 0.
+            // The old packed-layout count here made their gates bail, which aborts maskless strips.
+            ggml_flash_attn_ext_set_n_kv_max(cur, 0);
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

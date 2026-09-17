@@ -4,7 +4,10 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
-#include "qsa.cuh"
+#if defined(GGML_USE_HIP)
+#include "qsa-prefill.cuh"
+#include "qsa-decode.cuh"
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -515,6 +518,21 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
+static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const int device, const ggml_tensor * dst) {
+#ifdef GGML_USE_HIP
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) && Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
+        (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -642,6 +660,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    if (ggml_cuda_fattn_tile_q8_0_KV_supported(device, dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -666,11 +688,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // Only head sizes that have WMMA device code in flash_attn_ext_f16 (fattn-mma-f16.cuh, AMD_WMMA_AVAILABLE guard:
+    // DKQ <= 128 or DKQ == 256) may be routed here; any other head size (e.g. 192) hits NO_DEVICE_CODE -> __trap().
+    if ((amd_wmma_available(cc) && gqa_opt_applies && (Q->ne[0] <= 128 || Q->ne[0] == 256)) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // On RDNA3.5 the D=256 tile kernel is FMA-bound for prefill batches; the WMMA kernel with 64 columns is ~30-45% faster.
+    // For smaller batches (ncols 16/32 configs) the tile kernel is still faster.
     if (GGML_CUDA_CC_IS_RDNA3_5(cc) && gqa_opt_applies && Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] * gqa_ratio_eff > 32) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
@@ -709,6 +735,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            if (ggml_cuda_fattn_tile_q8_0_KV_supported(device, dst)) {
+                break;
+            }
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -730,17 +762,28 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
     if (ggml_cuda_flash_attn_ext_qsa_decode_supported(ctx, dst)) {
         ggml_cuda_flash_attn_ext_qsa_decode(ctx, dst);
         return;
     }
-    if (ggml_cuda_flash_attn_ext_qsa_supported(ctx, dst)) {
-        ggml_cuda_flash_attn_ext_qsa(ctx, dst);
+    if (ggml_cuda_flash_attn_ext_qsa_prefill_supported(ctx, dst)) {
+        ggml_cuda_flash_attn_ext_qsa_prefill(ctx, dst);
         return;
     }
-    // only the qsa kernel honours the selected-cell indices; the kernels below attend to every key, so
-    // a maskless sparse op reaching them would read cells the mask exists to hide
-    GGML_ASSERT((dst->src[3] || !dst->src[5]) && "sparse flash attention without a mask needs the qsa kernel");
+#endif
+    // a selected-key op without a mask carries its visibility only in src[5], which the dense kernels ignore:
+    // reaching them would attend to the whole padded cache
+    if (dst->src[5] && !dst->src[3]) {
+        const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * ids = dst->src[5];
+        GGML_ABORT("flash_attn_ext: maskless selected-key attention was not taken by a QSA kernel (%s): q [%lld,%lld,%lld,%lld] %s nb %zu/%zu, "
+                   "k [%lld,%lld,%lld,%lld] %s nb %zu/%zu/%zu, v %s nb %zu/%zu, ids [%lld,%lld,%lld,%lld] nb %zu, src6 %d src7 %d p4 %d dst contiguous %d",
+                   dst->name, (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3], ggml_type_name(q->type), q->nb[1], q->nb[2],
+                   (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3], ggml_type_name(k->type), k->nb[0], k->nb[1], k->nb[2],
+                   ggml_type_name(v->type), v->nb[1], v->nb[2], (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2], (long long) ids->ne[3], ids->nb[1],
+                   dst->src[6] != nullptr, dst->src[7] != nullptr, ggml_get_op_params_i32(dst, 4), ggml_is_contiguous(dst));
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

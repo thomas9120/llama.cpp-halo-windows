@@ -7,6 +7,9 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         const char * q, const char * k, const char * v, const char * mask, const char * ids,
         size_t q1, size_t q2, size_t k1, size_t k2, size_t v1, size_t v2, size_t m1, size_t i1,
         int nk, int ns, int nh, int splits, float scale, float * partial) {
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(RDNA3)
+    NO_DEVICE_CODE;
+#else
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, r = lane & 15, hi = lane >> 4;
     const int kvh = blockIdx.x, query = blockIdx.y, split = blockIdx.z;
     const int * ir = (const int *) (ids + query*i1);
@@ -107,11 +110,12 @@ static __global__ __launch_bounds__(256) void qsa_decode_wmma_partial(
         __syncthreads();
     }
     if (r < 12) {
-        float * dst = partial + ((query*nh+kvh*12+r)*splits+split)*258;
+        float * dst = partial + ((size_t(query)*nh+kvh*12+r)*splits+split)*258;
 #pragma unroll
         for (int t = 0; t < 2; ++t)
 #pragma unroll
             for (int e = 0; e < 8; ++e) { dst[32*w+16*t+2*e+hi] = output[t][e]; }
         if (w == 0 && hi == 0) { dst[256] = maximum; dst[257] = normalizer; }
     }
+#endif
 }
