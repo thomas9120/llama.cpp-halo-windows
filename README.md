@@ -17,6 +17,12 @@
 
 </div>
 
+## About this fork
+
+Strix Halo (gfx1151) focused fork of llama.cpp, tuned for decode speed on ROCm/Windows (TheRock). It carries RDNA3.5-specific HIP kernel work (single-column matvec, fused-quantize and grouped decode matvecs, MMQ tile tuning, MoE fast paths) plus qwen4exp support.
+
+It also adds adaptive speculative draft sizing: each draft is sized from measured acceptance instead of always drafting `--spec-draft-n-max`. Enable with `--spec-draft-adaptive` (works with `--spec-type draft-mtp` and other draft types).
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
