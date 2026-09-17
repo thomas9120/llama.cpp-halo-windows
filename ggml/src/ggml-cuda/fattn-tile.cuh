@@ -662,11 +662,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
 #if defined(RDNA3_5)
     constexpr bool common_mask = DKQ == 256 && DV == 256 && ncols1 == 4 && ncols2 == 8;
-    const int j_mask = common_mask ? fastmodulo(col_Q_0 + ((threadIdx.y / np)*cpw)/ncols2, ne01) : 0;
-    float mask_value[common_mask ? nbatch_fa/(np*warp_size) : 1];
+    float mask_value[common_mask ? nbatch_fa/(np*warp_size) : 1] = {0.0f};
+    if constexpr (common_mask) {
+        const int j_mask = fastmodulo(col_Q_0 + ((threadIdx.y / np)*cpw)/ncols2, ne01);
 #pragma unroll
-    for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
-        mask_value[i0/(np*warp_size)] = common_mask ? slope*__half2float(mask[j_mask*stride_mask + k_VKQ_0 + i0 + (threadIdx.y % np)*warp_size + threadIdx.x]) : 0.0f;
+        for (int i0 = 0; i0 < nbatch_fa; i0 += np*warp_size) {
+            mask_value[i0/(np*warp_size)] = slope*__half2float(mask[j_mask*stride_mask + k_VKQ_0 + i0 + (threadIdx.y % np)*warp_size + threadIdx.x]);
+        }
     }
 #else
     constexpr bool common_mask = false;

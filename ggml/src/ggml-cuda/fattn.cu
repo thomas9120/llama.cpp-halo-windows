@@ -518,15 +518,16 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const ggml_tensor * dst) {
+static bool ggml_cuda_fattn_tile_q8_0_KV_supported(const int device, const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int cc = ggml_cuda_info().devices[device].cc;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     return GGML_CUDA_CC_IS_RDNA3_5(cc) && Q->ne[1] == 1 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && Q->ne[0] == K->ne[0] && K->ne[0] == V->ne[0] &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
 #else
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #endif // GGML_USE_HIP
@@ -659,7 +660,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
-    if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
+    if (ggml_cuda_fattn_tile_q8_0_KV_supported(device, dst) && gqa_opt_applies && gqa_ratio_eff >= 2) {
         return BEST_FATTN_KERNEL_TILE;
     }
 
@@ -734,7 +735,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            if (ggml_cuda_fattn_tile_q8_0_KV_supported(dst)) {
+            if (ggml_cuda_fattn_tile_q8_0_KV_supported(device, dst)) {
                 break;
             }
             need_f16_K = true;
