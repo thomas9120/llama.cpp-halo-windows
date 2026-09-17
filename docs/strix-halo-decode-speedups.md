@@ -102,10 +102,10 @@ Also deferred from inside the ported files (same files, later steps):
   (`set_n_kv_max(cur, 0)`); the kernels never read p4. Nothing else in
   the tree reads p4 for these nodes (HIP tile `use_sparse` is always
   false, the NVIDIA sparse check is compiled out).
-* Follow-up: remove the `qsa_pack_keys/values` pre-pass and the src6/7
-  attaches; halo kernels pack in-kernel, so the pre-pass is dead weight
-  (it still runs). Also lets small masked strips take the decode gate,
-  which rejects attached src6/7.
+* Follow-up (done): removed the `qsa_pack_keys/values` pre-pass
+  (`pack.inc` deleted) and the src6/7 attaches; halo kernels pack
+  in-kernel. Nodes now carry null src4/6/7 and p4 == 0, matching
+  halo's gate contract for both prefill and decode.
 
 ## Verify
 
