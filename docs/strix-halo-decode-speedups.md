@@ -51,7 +51,8 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
    DEFERRED.
 7. Flash-attention decode (`fattn.cu` + new `fattn-tile-rdna3-5.cu`).
    Q8_0 KV tile decode path (D=64/128/256, GQA>=2) + WMMA D=256
-   routing fixes. DEFERRED.
+   routing fixes. PORTED (commit `ce215c979`), including the QSA
+   split (item 11) it depends on.
 8. MMQ tile tuning (`mmq-config-rdna3-5.cuh`, `mmq.cuh` prefetch,
    `mmq-vec-dot.cuh` split-j). Mostly prefill/spec-verify.
    PORTED (commit `ba40f6862`). Kept the local 512-expert compact
@@ -63,7 +64,7 @@ Compared local HEAD against halo-box/strix-llama.cpp `0636c9ae`
     with BF16-only streams + `mmb_enabled()` gated to RDNA3.5.
     Reconcile with the Windows build before touching. DEFERRED.
 11. QSA split (`qsa.cu` -> `qsa-decode.cu` + `qsa-prefill.cu`).
-    Needed only when porting the FATTN routing. DEFERRED.
+    PORTED as part of item 7 (commit `ce215c979`).
 
 Also deferred from inside the ported files (same files, later steps):
 
