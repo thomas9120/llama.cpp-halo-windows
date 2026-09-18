@@ -206,7 +206,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 
     // flat [ple_head_dim, n_rows] gather target
-    if (hparams.ple_n_heads > 0) {
+    if (!mtp_only && hparams.ple_n_heads > 0) {
         // the head ranges are what the gather indexes, so they set the minimum row count
         int64_t ple_rows = 0;
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
@@ -233,6 +233,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
         auto & layer = layers[il];
+
+        if (mtp_only && il < n_layer) {
+            continue;
+        }
 
         const int flags = il < n_layer ? trunk_flags : mtp_flags;
 
@@ -308,9 +312,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
         layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
 
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
-        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
-        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { hc_dim }, flags | TENSOR_NOT_REQUIRED);
 
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
@@ -561,7 +566,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     GGML_ASSERT(layer.nextn.eh_proj     && "MTP block missing nextn.eh_proj");
     GGML_ASSERT(layer.nextn.enorm       && "MTP block missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm       && "MTP block missing nextn.hnorm");
-    GGML_ASSERT(layer.nextn.hc_head_norm && "MTP block missing nextn.hc_head_norm");
+
+    const bool has_head_mixer = layer.nextn.hc_head_norm && layer.nextn.hc_head_down && layer.nextn.hc_head_up;
+    ggml_tensor * head_norm = has_head_mixer ? layer.nextn.hc_head_norm : layer.nextn.shared_head_norm;
+    ggml_tensor * head_down = has_head_mixer ? layer.nextn.hc_head_down : layer.hc_ffn_down;
+    ggml_tensor * head_up   = has_head_mixer ? layer.nextn.hc_head_up   : layer.hc_ffn_up;
+    if (!head_norm || !head_down || !head_up) {
+        throw std::runtime_error("QWEN4EXP MTP: missing head mixer tensors");
+    }
 
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
@@ -748,7 +760,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_h_nextn = res_hc;
 
     cur = build_hc_mix(res_hc,
-            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            head_norm, head_down, head_up,
             nullptr, nullptr, -1);
     cb(cur, "mtp_hc_head", -1);
 

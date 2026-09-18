@@ -45,6 +45,7 @@
 /.build/
 /build*
 !/build-windows.ps1
+!/build-windows-vulkan.ps1
 /release
 /debug
 /libllama.so

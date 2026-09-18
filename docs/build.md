@@ -444,6 +444,24 @@ The QSA metadata test compiles the current production function with lightweight 
 ## Vulkan
 
 ### For Windows Users:
+
+**PowerShell build script (Visual Studio 2022)**
+
+Install Visual Studio 2022 with the x64 C++ build tools and CMake/Ninja tools, and the [LunarG Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows). Open a new PowerShell and run from the repository root:
+
+```powershell
+.\build-windows-vulkan.ps1
+```
+
+The script selects the VS 2022 x64 toolchain and builds `llama-server`, `llama-cli`, `llama-bench`, `llama-fit-params`, and `llama-perplexity` in Release mode. Executables are in `build-vulkan\bin`. It uses `VULKAN_SDK` by default; use `-VulkanSdkPath` to select another SDK, `-BuildDir` to select another output directory, or `-Jobs` to change the default 12 parallel jobs. `-ConfigureOnly` skips compilation. `-Portable` disables native CPU tuning and requests static OpenSSL libraries, matching the ROCm script. Use a fresh build directory when changing toolchains.
+
+```powershell
+.\build-windows-vulkan.ps1 -VulkanSdkPath C:\VulkanSDK\1.4.350.0 -Jobs 8
+.\build-vulkan\bin\llama-cli.exe --list-devices
+```
+
+A Vulkan-capable GPU driver is required to run the binaries.
+
 **w64devkit**
 
 Download and extract [`w64devkit`](https://github.com/skeeto/w64devkit/releases).
