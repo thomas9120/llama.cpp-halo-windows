@@ -2363,6 +2363,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // the n_tokens*40 budget below runs out by ubatch 3840: KDA costs 182 nodes + ~16/token
         // per layer, so 34 KDA layers alone need 6.2k + 31.9*n_tokens before DSA or the MoE
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+        // the 128-slot looped graph needs roughly one stack per token budget
+        res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
