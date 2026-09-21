@@ -4254,10 +4254,13 @@ struct test_snake_fuse : public test_case {
 struct test_hc_f32_consumer : public test_case {
     const int tokens;
     const ggml_type type_w;
+    const bool post_op;
+    const bool identity;
 
-    test_hc_f32_consumer(int tokens, ggml_type type_w) : tokens(tokens), type_w(type_w) {}
+    test_hc_f32_consumer(int tokens, ggml_type type_w, bool post_op = false, bool identity = true)
+        : tokens(tokens), type_w(type_w), post_op(post_op), identity(identity) {}
     std::string op_desc(ggml_tensor *) override { return "HC_F32_CONSUMER"; }
-    std::string vars() override { return VARS_TO_STR2(tokens, type_w); }
+    std::string vars() override { return VARS_TO_STR4(tokens, type_w, post_op, identity); }
     bool run_whole_graph() override { return true; }
     bool use_scheduler_allocation() override { return true; }
     double max_nmse_err() override { return type_w == GGML_TYPE_F32 ? 1e-5 : 5e-4; }
@@ -4265,17 +4268,21 @@ struct test_hc_f32_consumer : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int embd = 2560, hc = 4;
         auto * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
-        auto * block = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
+        auto * block = post_op ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, tokens) :
+                                ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
         auto * inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
-        auto * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, embd * hc);
+        auto * gamma = post_op ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd, hc) :
+                                ggml_new_tensor_1d(ctx, GGML_TYPE_F32, embd * hc);
         auto * weight = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.25f)), 2.0f);
-        weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens);
+        if (!post_op) { weight = ggml_reshape_3d(ctx, weight, 1, hc, tokens); }
         if (gf) { ggml_build_forward_expand(gf, block); ggml_build_forward_expand(gf, weight); }
-        auto * update = ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight);
-        auto * combined = ggml_add(ctx, residual, update);
+        auto * comb = identity ? nullptr : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, tokens);
+        auto * combined = post_op ? ggml_dsv4_hc_post(ctx, block, residual, weight, comb) :
+                                   ggml_add(ctx, residual, ggml_mul(ctx, ggml_repeat(ctx, block, residual), weight));
         auto * norm = ggml_rms_norm(ctx, combined, 1e-6f);
-        norm = ggml_reshape_2d(ctx, norm, embd * hc, tokens);
+        if (!post_op) { norm = ggml_reshape_2d(ctx, norm, embd * hc, tokens); }
         norm = ggml_mul(ctx, norm, gamma);
+        if (post_op) { norm = ggml_reshape_2d(ctx, norm, embd * hc, tokens); }
         ggml_set_name(norm, "test_hc_norm");
         auto * projection = ggml_new_tensor_2d(ctx, type_w, embd * hc, 4);
         ggml_set_name(projection, "test_hc_projection");
@@ -9550,6 +9557,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (int64_t n_tokens : {1, 32, 33, 512}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n_tokens, true));
+    }
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -11607,6 +11617,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_hc_f32_consumer(tokens, type));
         }
     }
+    for (int tokens : {1, 32, 128, 511, 512, 513, 1024, 4096}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_hc_f32_consumer(tokens, type, true));
+        }
+    }
+    test_cases.emplace_back(new test_hc_f32_consumer(32, GGML_TYPE_F32, true, false));
 
     return test_cases;
 }

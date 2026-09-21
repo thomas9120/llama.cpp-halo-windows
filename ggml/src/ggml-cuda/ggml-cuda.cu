@@ -3400,7 +3400,7 @@ static bool ggml_cuda_mean4_ranges_overlap(const ggml_tensor * a, const ggml_ten
 static int ggml_cuda_match_hc_combine_norm(
         const ggml_cgraph * graph, int i, int warp_size, ggml_cuda_hc_combine_norm_args & args) {
     const ggml_tensor * scale1 = graph->nodes[i];
-    if (scale1->op != GGML_OP_SCALE || i + 8 >= graph->n_nodes) {
+    if (scale1->op != GGML_OP_SCALE || i + 5 >= graph->n_nodes) {
         return 0;
     }
     const ggml_tensor * sigmoid = graph->nodes[i + 1];
@@ -3413,18 +3413,23 @@ static int ggml_cuda_match_hc_combine_norm(
     while (j < graph->n_nodes && j < i + 7 && graph->nodes[j]->op == GGML_OP_RESHAPE) {
         ++j;
     }
-    if (j + 4 >= graph->n_nodes) {
+    const bool hc_post = j < graph->n_nodes && graph->nodes[j]->op == GGML_OP_DSV4_HC_POST;
+    const int combine_idx = hc_post ? j : j + 2;
+    if (combine_idx + 2 >= graph->n_nodes) {
         return 0;
     }
-    const ggml_tensor * repeat = graph->nodes[j];
-    const ggml_tensor * mul = graph->nodes[j + 1];
-    ggml_tensor * add = graph->nodes[j + 2];
-    const ggml_tensor * rms = graph->nodes[j + 3];
-    if (repeat->op != GGML_OP_REPEAT || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD ||
-            rms->op != GGML_OP_RMS_NORM || rms->src[0] != add) {
+    const ggml_tensor * repeat = hc_post ? nullptr : graph->nodes[j];
+    const ggml_tensor * mul = hc_post ? nullptr : graph->nodes[j + 1];
+    ggml_tensor * add = graph->nodes[combine_idx];
+    const ggml_tensor * rms = graph->nodes[combine_idx + 1];
+    if (hc_post ? (add->src[3] != nullptr || add->src[2] != scale2) :
+            (repeat->op != GGML_OP_REPEAT || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD)) {
         return 0;
     }
-    int end = j + 4;
+    if (rms->op != GGML_OP_RMS_NORM || rms->src[0] != add) {
+        return 0;
+    }
+    int end = combine_idx + 2;
     const ggml_tensor * norm = rms;
     if (graph->nodes[end]->op == GGML_OP_RESHAPE) {
         norm = graph->nodes[end++];
@@ -3437,27 +3442,35 @@ static int ggml_cuda_match_hc_combine_norm(
         return 0;
     }
     const ggml_tensor * inject = scale1->src[0];
-    const ggml_tensor * block = repeat->src[0];
-    const ggml_tensor * weights = mul->src[0] == repeat ? mul->src[1] : mul->src[0];
-    const ggml_tensor * residual = add->src[0] == mul ? add->src[1] : add->src[0];
+    const ggml_tensor * block = hc_post ? add->src[0] : repeat->src[0];
+    const ggml_tensor * weights = hc_post ? scale2 : (mul->src[0] == repeat ? mul->src[1] : mul->src[0]);
+    const ggml_tensor * residual = hc_post ? add->src[1] : (add->src[0] == mul ? add->src[1] : add->src[0]);
     const ggml_tensor * gamma = mulg->src[0] == norm ? mulg->src[1] : mulg->src[0];
     const int64_t width = add->ne[0], hc = add->ne[1], tokens = add->ne[2];
     for (const ggml_tensor * tensor : {scale1, sigmoid, scale2, inject, block, weights,
             repeat, mul, (const ggml_tensor *) add, residual, rms, norm, (const ggml_tensor *) mulg, gamma}) {
-        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+        if (tensor && (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor))) {
             return 0;
         }
+    }
+    if (hc_post) {
+        if (weights->ne[0] != hc || weights->ne[1] != tokens || weights->ne[2] != 1 || weights->ne[3] != 1 ||
+                block->ne[0] != width || block->ne[1] != tokens || block->ne[2] != 1 || block->ne[3] != 1) {
+            return 0;
+        }
+    } else if (weights->ne[0] != 1 || weights->ne[1] != hc || weights->ne[2] != tokens || weights->ne[3] != 1 ||
+            block->ne[0] != width || block->ne[1] != 1 || block->ne[2] != tokens || block->ne[3] != 1 ||
+            (mul->src[0] != repeat && mul->src[1] != repeat) || weights == repeat ||
+            (add->src[0] != mul && add->src[1] != mul) || residual == mul ||
+            !ggml_are_same_shape(repeat, add) || !ggml_are_same_shape(mul, add)) {
+        return 0;
     }
     if (add->ne[3] != 1 || tokens < 1 || tokens > 65535 ||
             !ggml_are_same_shape(scale1, inject) || !ggml_are_same_shape(scale2, inject) ||
             ggml_nelements(inject) != hc * tokens || ggml_nrows(inject) != tokens ||
             !(weights == scale2 || (weights->op == GGML_OP_RESHAPE && weights->src[0] == scale2 &&
                 weights->view_src == scale2)) ||
-            weights->ne[0] != 1 || weights->ne[1] != hc || weights->ne[2] != tokens || weights->ne[3] != 1 ||
-            block->ne[0] != width || block->ne[1] != 1 || block->ne[2] != tokens || block->ne[3] != 1 ||
-            (mul->src[0] != repeat && mul->src[1] != repeat) || weights == repeat ||
-            (add->src[0] != mul && add->src[1] != mul) || residual == mul || gamma == norm ||
-            !ggml_are_same_shape(repeat, add) || !ggml_are_same_shape(mul, add) ||
+            gamma == norm ||
             !ggml_are_same_shape(residual, add) || !ggml_are_same_shape(rms, add) ||
             !ggml_are_same_shape(mulg, norm) || ggml_nelements(norm) != ggml_nelements(add) ||
             ggml_nelements(gamma) != width * hc) {
@@ -3498,7 +3511,7 @@ static int ggml_cuda_match_hc_combine_norm(
         indices[count] = k;
         ops[count++] = tensor->op;
     }
-    const int outputs[] = {j + 2, end};
+    const int outputs[] = {combine_idx, end};
     return ggml_can_fuse_subgraph_ext(graph, indices, count, ops, outputs, 2) ? end - i : 0;
 }
 
@@ -3973,7 +3986,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_ABORT("hc_combine_norm: output %s is marked BF16-only but the fused kernel was refused (buffer aliasing)", args.out_xn->name);
         }
         if (skip > 0 && ggml_cuda_hc_combine_norm_alias_ok(args)) {
-            args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
+            args.out_xn_bf16 = ggml_cuda_mmb_cache_reserve(*cuda_ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn), args.out_res->ne[2]);
             args.store_xn_f32 = !(args.out_xn_bf16 && ggml_cuda_mmb_is_bf16_only(args.out_xn));
             if (ggml_cuda_mmb_res16()) {   // 16-bit residual stream, in place over each tensor's own buffer
                 const ggml_tensor * rin  = args.residual->view_src ? args.residual->view_src : args.residual;
@@ -5093,7 +5106,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const int skip = ggml_cuda_match_hc_combine_norm(cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].warp_size, ca);
                 if (skip <= 0) continue;   // structure only: data pointers are not assigned yet inside graph_optimize (alias check would always fail)
                 const ggml_tensor * xn = ca.out_xn;
-                if (ggml_nrows(xn) < 512) continue;
+                if (ca.out_res->ne[2] < 512) continue;
                 bool ok = true; int nread = 0;
                 for (int n = i + 1; n < cgraph->n_nodes && ok; ++n) {
                     const ggml_tensor * t = cgraph->nodes[n];
@@ -5328,6 +5341,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 const int skip = ggml_cuda_match_hc_combine_norm(
                     cgraph, i, ggml_cuda_info().devices[cuda_ctx->device].warp_size, args);
                 if (skip > 0) {
+                    params->add_alloc_dep(params->user_data, args.out_res, args.out_xn);
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.block_out), args.out_xn);
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(args.inject), args.out_xn);
                     i += skip;

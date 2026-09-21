@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "hc-mix.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -255,6 +256,19 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) && gated && hc >= 2 && hc <= 16 &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst) &&
+            ggml_are_same_shape(x, weights)) {
+        ggml_cuda_hc_mix_args args{};
+        args.xn = x;
+        args.gate = weights;
+        args.dst = dst;
+        args.hc = (int) hc;
+        args.scale = scale;
+        ggml_cuda_op_hc_mix_reduce(ctx, args);
+        return;
+    }
 
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;

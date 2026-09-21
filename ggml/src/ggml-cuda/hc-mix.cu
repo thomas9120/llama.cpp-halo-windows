@@ -109,7 +109,8 @@ void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda
 
     const int64_t n_embd   = dst->ne[0];
     const int64_t n_tokens = ggml_nrows(dst);
-    GGML_ASSERT(xn->ne[0] == n_embd * args.hc && ggml_nrows(xn) == n_tokens);
+    GGML_ASSERT((xn->ne[0] == n_embd * args.hc && ggml_nrows(xn) == n_tokens) ||
+                (xn->ne[0] == n_embd && xn->ne[1] == args.hc && xn->ne[2] == n_tokens && xn->ne[3] == 1));
     GGML_ASSERT(ggml_are_same_shape(xn, gate));
 
     const bool stage = hc_ranges_overlap(dst, xn) || hc_ranges_overlap(dst, gate);
