@@ -706,8 +706,8 @@ void ggml_cuda_mmb_release_all() {
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
 }
-uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
-    if (!mmb_enabled() || ggml_nrows(t) < mmb_min_t()) return nullptr;
+uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n, int64_t n_tokens) {
+    if (!mmb_enabled() || n_tokens < mmb_min_t()) return nullptr;
     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
 }
 
