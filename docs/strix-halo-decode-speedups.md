@@ -125,3 +125,22 @@ same Qwen3.8 quant before/after:
 Suggested order for the deferred items: MMQ config (8) -> FQ (6) ->
 MMV_GROUP (3) -> GDN fused (4) -> WEIGHTED_DOWN (5) -> FATTN tile
 (7) -> MMID_512 (9) -> hyperconn reconcile (10) -> QSA split (11).
+
+## HC dispatch after the mainline integration (2026-09-20)
+
+The Qwen4exp graph now uses gated `DSV4_HC_PRE` and identity `DSV4_HC_POST`. The gfx1151 backend routes eligible contiguous gated PRE inputs through the local HC mix kernel. The combine-plus-normalization matcher accepts identity POST followed by grouped RMSNorm and gamma multiplication, while retaining the decomposed graph pattern. Nonidentity POST, unsupported layouts, and other architectures retain their existing paths.
+
+The combined residual and normalized output must occupy different buffers, including when the residual has no later consumer. An allocation dependency enforces that requirement. BF16 cache reservation and normalized-stream marking use token count rather than grouped row count (`hc * tokens`). The Windows HC16 exclusions remain in place.
+
+Component measurements compare the integrated baseline `64dddeb35` with these working-tree changes, using separate copies of the HIP DLLs. Both execute the new combine-plus-normalization graph with F32 inputs, embedding width 2560, four HC streams, and all tensors on ROCm0 (Radeon 8060S, gfx1151). Build: Release, VS 2022, TheRock at `C:/TheRock/build`, Clang 23. HIP graph capture is enabled; results are medians of five trials of 30 executions after five warmups. Driver version was unavailable. Model quantization, KV settings, context occupancy, lazy reads, speculation, and sampling do not apply to this synthetic graph.
+
+| Tokens | Integrated baseline (us) | Restored fusion (us) |
+| --- | ---: | ---: |
+| 1 | 16.37 | 10.82 |
+| 128 | 94.53 | 28.33 |
+| 512 | 356.40 | 406.72 |
+| 4096 | 3620.78 | 3136.78 |
+
+The restored path produces the same outputs as the old fused graph in this benchmark; the unfused baseline differs by at most `3.58e-7`. At 512 tokens, the restored path is slower in isolation. It preserves the existing BF16 cache production for subsequent matrix operations, whose benefit this graph does not measure. No token-specific performance cutoff was added based on this isolated comparison. Separate PRE measurements show similar large-batch timings and noisy small-batch timings, so they do not establish an additional throughput gain.
+
+Validation: the full Windows regression suite and all 14 source guards pass. ROCm backend checks against CPU pass 27/27 `HC_F32_CONSUMER`, 22/22 `DSV4_HC_PRE`, and 6/6 `DSV4_HC_POST` cases. Vulkan passes 27/27 consumer, 10/10 supported PRE, and 6/6 POST cases; 12 PRE cases with unsupported stream counts are skipped. The added cases cover the 32-token HC mix boundary, the 512-token BF16-cache boundary, F32 and Q8 consumers, and nonidentity POST fallback. Logs and temporary benchmark harnesses are under the ignored `build-review-integration/` directory. These checks do not substitute for full-model generation, MTP, long-context, or delivered-throughput comparisons.
