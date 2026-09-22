@@ -29,7 +29,7 @@ if (Test-Path -LiteralPath $PackageDir) {
 }
 New-Item -ItemType Directory -Path $BinDir | Out-Null
 
-foreach ($Tool in @('llama-server', 'llama-cli', 'llama-bench', 'llama-fit-params')) {
+foreach ($Tool in @('llama-server', 'llama-cli', 'llama-bench', 'llama-fit-params', 'llama-perplexity')) {
     Copy-Item -LiteralPath "$BuildDir/bin/$Tool.exe" -Destination $BinDir
 }
 Copy-Item -Path "$BuildDir/bin/*.dll" -Destination $BinDir
@@ -66,7 +66,7 @@ $SavedDeviceLibPath = $env:HIP_DEVICE_LIB_PATH
 try {
     $env:PATH = "$BinDir;$env:SystemRoot/System32;$env:SystemRoot"
     $env:HIP_DEVICE_LIB_PATH = $null
-    foreach ($Tool in @('llama-server', 'llama-cli', 'llama-bench', 'llama-fit-params')) {
+    foreach ($Tool in @('llama-server', 'llama-cli', 'llama-bench', 'llama-fit-params', 'llama-perplexity')) {
         & "$BinDir/$Tool.exe" --help *> "$OutputDir/$Tool-help.log"
         if ($LASTEXITCODE -ne 0) { throw "$Tool package smoke test failed." }
     }
