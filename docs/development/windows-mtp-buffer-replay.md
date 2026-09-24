@@ -57,3 +57,24 @@ Configuration:
 Requests used generated JavaScript and two synthetic color images. These are bounded smoke tests totaling 1,024 generated tokens, not a replay of the original coding task or a 179K-context endurance test. They were run after the user reported an unpatched run past 179K context with multiple screenshots and no failure. That result does not isolate the cause of the earlier crash.
 
 Artifacts are under `build-rocm10-mtp-fix/windows-regression` and `build-rocm10-mtp-fix/model-validation`, including launch arguments, loaded runtime modules, responses, timings, and server logs. The test server was stopped after validation. Other open PRs remain outside this port.
+
+### Subsequent allocation failure (2026-09-24)
+
+A later run with adaptive drafting disabled reached about 189K cached tokens in a 262,144-token context, then failed while replaying an image chunk. The log records a failed 2,923,366,272-byte (2.72 GiB) `ROCm_Host` allocation, including failure of the CPU allocation fallback. The server returned an error and crashed during the next request. This is an allocation failure below the context limit; the log does not establish whether system commit, available RAM, or another allocation constraint caused it.
+
+Windows Event 1000 records exception `0xc0000005` in `ggml-base.dll` at offset `0x1d1d0`. Symbolization and disassembly resolve this to the virtual-buffer dereference in `ggml_gallocr_alloc_graph`. The deployed DLL matches the preceding patched build (SHA-256 `531ab477c01a26a0b970a23cdc1c6acf61326449629f47e345ef8b9b7751ba4f`).
+
+The allocator records the new graph's sizes before reserving its backing buffers. If reservation fails, a retry with the same graph can incorrectly reuse those recorded sizes and dereference a missing buffer. Shared buffer aliases can also retain freed pointers when reservation exits early. The correction checks for missing buffers before graph reuse and updates every alias immediately when its backing buffer changes. This does not reduce the memory required by the graph.
+
+The existing `test-alloc` now forces allocation failures without memory pressure. Against the exact deployed DLL, the repeated-failure test exits with `0xc0000005` after a forced 16-byte allocation failure. The fixed allocator must reject repeated failures, recover when allocation becomes available, and support both destruction and retry after failure at either of two distinct buffer types with a shared alias. The Windows regression runner includes this test even with `-SkipGpu`.
+
+[Canonical issue #23422](https://github.com/ggml-org/llama.cpp/issues/23422) reports the same missing-buffer dereference after a failed reservation, with a different initial CLIP warmup failure. [Halo PR #37](https://github.com/halo-box/strix-llama.cpp/pull/37) addresses persistent view initialization after allocation splits; it is a different failure path and is not part of this correction.
+
+Validation of this correction on base `784d4741c` with local changes:
+
+- ROCm/Clang Release and Vulkan/MSVC Release builds passed in `build-rocm10-gfx1151` and `build-vulkan`. Both detected the Radeon 8060S, and all 18 allocator tests passed with each build, including explicit checks that destruction releases all mock buffers.
+- Full `test-windows.ps1 -Jobs 8` passed, including allocator recovery, server recovery, lazy reads, QSA CPU/GPU visibility, K-pool, MMB context overlap, and F16/Q8 attention.
+- Fixed ROCm `ggml-base.dll` SHA-256: `14e78f290cba02b81e6a9584f7f41b5149b56a80aca493241b31c5b3108e4c90`.
+- Crash-event details, baseline reproduction, Vulkan test output, and build logs are in the ignored `build-mtp-buffer-fix/allocator-*` artifacts. ROCm runtime logs are under `build-rocm10-gfx1151/windows-regression`.
+
+These checks reproduce and correct the allocator failure mechanism. They do not reproduce the original system memory pressure or repeat the 189K multimodal run. The allocation-pressure trigger and model-level continuation after such a failure remain unverified.

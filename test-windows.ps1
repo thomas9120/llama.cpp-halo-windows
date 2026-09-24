@@ -84,6 +84,9 @@ try {
         Invoke-Logged "$Tool-help" (Join-Path $BinDir "$Tool.exe") @('--help')
     }
 
+    Invoke-Logged 'allocator-build' 'cmake' @('--build', $BuildDir, '--target', 'test-alloc', '--parallel', "$Jobs")
+    Invoke-Logged 'allocator-runtime' (Join-Path $BinDir 'test-alloc.exe') @()
+
     $ReaderExe = Join-Path $LogDir 'test-lazy-reader.exe'
     Invoke-Logged 'reader-build' (Join-Path $RocmPath 'lib/llvm/bin/clang++.exe') @(
         '-std=c++17', '-O2', '-fms-runtime-lib=dll', '-DGGML_SHARED', '-D_CRT_SECURE_NO_WARNINGS',

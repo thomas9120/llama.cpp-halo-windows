@@ -17,6 +17,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
     size_t alignment       = 8;
+    bool fail_allocations  = false;
 
     ggml_backend_buffer_i              buffer_interface;
     ggml_backend_device                device;
@@ -40,6 +41,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (ctx->fail_allocations) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -615,6 +619,64 @@ static void test_reallocation() {
     }
 }
 
+static void test_allocation_failure() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * input = make_input_with_size(ctx, 16);
+    ggml_tensor * out = ggml_scale(ctx, input, 2.0f);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+
+    backend.context->fail_allocations = true;
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+    backend.context->fail_allocations = false;
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+    check_all_allocated(graph);
+}
+
+static void test_shared_buffer_allocation_failure() {
+    for (int failing_backend = 0; failing_backend < 2; ++failing_backend) {
+        for (bool recover : { false, true }) {
+            dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+            dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+            ggml_backend_buffer_type_t bufts[] = { &backend_a.buffer_type, &backend_b.buffer_type, &backend_a.buffer_type };
+            ggml_gallocr_ptr galloc(ggml_gallocr_new_n(bufts, 3));
+            const int leaf_buffer_ids[] = { 2, 1 };
+            const int node_buffer_ids[] = { 2 };
+
+            for (size_t size : { 16, 32 }) {
+                auto [ctx, graph, ctx_ptr] = make_context();
+                ggml_tensor * a = make_input_with_size(ctx, size);
+                ggml_tensor * b = make_input_with_size(ctx, size);
+                ggml_tensor * out = ggml_add(ctx, a, b);
+                ggml_set_output(out);
+                ggml_build_forward_expand(graph, out);
+                GGML_ASSERT(graph->n_leafs == 2 && graph->n_nodes == 1);
+
+                if (size == 32) {
+                    dummy_backend & failing = failing_backend == 0 ? backend_a : backend_b;
+                    failing.context->fail_allocations = true;
+                    GGML_ASSERT(!ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+                    GGML_ASSERT(!ggml_gallocr_alloc_graph(galloc.get(), graph));
+                    if (!recover) {
+                        break;
+                    }
+                    failing.context->fail_allocations = false;
+                }
+                GGML_ASSERT(ggml_gallocr_reserve_n(galloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+                GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+                check_all_allocated(graph);
+                check_no_overlap(graph);
+            }
+            galloc.reset();
+            GGML_ASSERT(backend_a.context->buffers.empty());
+            GGML_ASSERT(backend_b.context->buffers.empty());
+        }
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -706,6 +768,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_allocation_failure", test_allocation_failure);
+    run("test_shared_buffer_allocation_failure", test_shared_buffer_allocation_failure);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_pinned_no_inplace", test_pinned_no_inplace);
     run("test_pinned_view_root_no_inplace", test_pinned_view_root_no_inplace);
