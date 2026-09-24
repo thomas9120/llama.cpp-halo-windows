@@ -171,6 +171,7 @@ try {
             # This compiler-only path causes HIP runtime initialization failures on this SDK/driver combination.
             $env:HIP_DEVICE_LIB_PATH = $null
             Invoke-Logged 'qsa-gpu' $QsaExe @('--gpu')
+            Invoke-Logged 'mmb-context' (Join-Path $BinDir 'test-backend-ops.exe') @('test', '-b', 'ROCm0', '-o', 'MMB_CONTEXT')
             Invoke-Logged 'attention' (Join-Path $BinDir 'test-backend-ops.exe') @(
                 'test', '-b', 'ROCm0', '-o', 'FLASH_ATTN_EXT', '-p', 'hsk=256,hsv=256,nh=2,'
             )
