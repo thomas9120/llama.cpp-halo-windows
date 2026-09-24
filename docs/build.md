@@ -429,6 +429,8 @@ For Qwen3.8-Flash-Next, `--lazy-mode on-direct` supports Windows through concurr
 
 #### Checking an upstream sync
 
+The Windows regression runner includes `test-alloc`, which forces backend allocation failures and checks repeated failure, successful retry, and shared-buffer cleanup without exhausting system memory.
+
 Run `.\test-windows.ps1` after merging or rebasing upstream, before copying binaries to a launcher. It rebuilds with `build-windows.ps1`, checks that all four tools start, runs synthetic lazy-reader tests, and runs the existing ROCm attention tests against their CPU reference. It requires the same SDK and VS 2022 installation as the build script, a `gfx1151` GPU, and a filesystem supporting sparse files. No model download is needed. `-RocmPath`, `-BuildDir`, and `-Jobs` override the build settings.
 
 The source guards flag changes to the three Windows HC16 workarounds, F16-only sparse attention selection, Windows direct-reader activation and prefetch, and the build target list. These are conservative checks of the current source structure, not proof of correctness: an upstream rewrite may require updating them after review. Do not remove a failing check just to accept a merge.
