@@ -427,6 +427,8 @@ This fork disables the three former `LLAMA_MMB_HC16` controls on Windows because
 
 For Qwen3.8-Flash-Next, `--lazy-mode on-direct` supports Windows through concurrent, buffered file reads for the PLE table, including speculative prefetch. The startup log reports `direct reads enabled` when active; if the file cannot be reopened, it warns and falls back to lazy memory-mapped reads. This mode still uses the Windows file cache. Compare it with `--lazy-mode on` using real prompts; performance depends on storage and available memory.
 
+Windows HIP on RDNA3.5 does not advertise pinned host buffers as directly GPU-compatible. This avoids a reproduced long-context screenshot crash while preserving pinned transfers, but can require extra device buffers. See the [diagnosis and validation limits](development/windows-mtp-buffer-replay.md#direct-pinned-host-execution-failure-2026-09-25).
+
 #### Checking an upstream sync
 
 The Windows regression runner includes `test-alloc`, which forces backend allocation failures and checks repeated failure, successful retry, and shared-buffer cleanup without exhausting system memory.
@@ -463,6 +465,8 @@ The script selects the VS 2022 x64 toolchain and builds `llama-server`, `llama-c
 ```
 
 A Vulkan-capable GPU driver is required to run the binaries.
+
+For stable ZIP releases through GitHub Actions, see [Windows Vulkan releases](windows-vulkan-release.md).
 
 **w64devkit**
 

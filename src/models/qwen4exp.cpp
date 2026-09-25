@@ -1047,10 +1047,23 @@ static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
     return n_stream == 1 ? std::min<int64_t>(n_tokens, 512) : n_tokens;
 }
 
+static ggml_tensor * qwen4exp_shared_input_view(std::vector<ggml_tensor *> * views, ggml_tensor * view) {
+    if (views == nullptr) { return view; }
+    GGML_ASSERT(view->view_src != nullptr);
+    for (auto * cached : *views) {
+        if (cached->view_src == view->view_src && cached->view_offs == view->view_offs &&
+            ggml_are_same_shape(cached, view) && std::equal(cached->nb, cached->nb + GGML_MAX_DIMS, view->nb)) {
+            return cached;
+        }
+    }
+    views->push_back(view);
+    return view;
+}
+
 static ggml_tensor * qwen4exp_apply_cell_visibility(ggml_context * ctx, ggml_tensor * mask,
-        ggml_tensor * bias, int64_t first) {
-    auto * cell_bias = ggml_view_4d(ctx, bias, bias->ne[0], mask->ne[1], 1, mask->ne[3],
-            bias->nb[1], bias->nb[2], bias->nb[2], first*bias->nb[1]);
+        ggml_tensor * bias, int64_t first, std::vector<ggml_tensor *> * views) {
+    auto * cell_bias = qwen4exp_shared_input_view(views, ggml_view_4d(ctx, bias, bias->ne[0], mask->ne[1], 1, mask->ne[3],
+            bias->nb[1], bias->nb[2], bias->nb[2], first*bias->nb[1]));
     if (!ggml_is_contiguous(cell_bias)) { cell_bias = ggml_cont(ctx, cell_bias); }
     // Keep exclusions from top-k padding without adding the tail's selection priority to attention logits.
     auto * visibility = ggml_clamp(ctx, cell_bias, -INFINITY, 0.0f);
@@ -1208,6 +1221,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(q, "indexer_q", il);
 
     const int64_t strip = qwen4exp_query_strip(n_tps, n_stream);
+    // Keep small text/decode graphs unchanged; share the large prefill inputs.
+    auto * input_views = ubatch.token && n_tps < 128 ? nullptr : &qsa_input_views;
     std::vector<ggml_tensor *> selected;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
@@ -1219,10 +1234,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             score_keys = ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream, pooled->nb[1], pooled->nb[2], 0);
             cb(score_keys, "indexer_k_bounded", il);
         }
-        ggml_tensor * bias = inp->compact ? nullptr : ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
-                inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
-        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : ggml_view_4d(ctx0, kq_mask,
-                n_kv, n_query, 1, n_stream, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]);
+        ggml_tensor * bias = inp->compact ? nullptr : qwen4exp_shared_input_view(input_views,
+                ggml_view_3d(ctx0, inp->bias, inp->bias->ne[0], n_query, n_stream,
+                    inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]));
+        ggml_tensor * query_mask = kq_mask == nullptr ? nullptr : qwen4exp_shared_input_view(input_views,
+                ggml_view_4d(ctx0, kq_mask, n_kv, n_query, 1, n_stream,
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], first*kq_mask->nb[1]));
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -1339,13 +1356,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         cparams.flash_attn && cparams.offload_kqv && hparams.f_max_alibi_bias==0.0f && !hparams.attn_soft_cap &&
         shared_qsa!=qsa_inps.end() && shared_qsa->second->maskless;
     const int64_t strip=layout_prefill ? n_tps : qwen4exp_query_strip(n_tps,n_stream);
+    // Keep small text/decode graphs unchanged; share the large prefill inputs.
+    auto * input_views = ubatch.token && n_tps < 128 ? nullptr : &qsa_input_views;
     std::vector<ggml_tensor *> output;
     for (int64_t first = 0; first < n_tps; first += strip) {
         const int64_t n_query = std::min(strip, n_tps - first);
-        ggml_tensor * kq_mask = ggml_view_4d(ctx0, mask_all, mask_all->ne[0], n_query, 1, n_stream,
-                mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], first*mask_all->nb[1]);
+        ggml_tensor * kq_mask = qwen4exp_shared_input_view(input_views,
+                ggml_view_4d(ctx0, mask_all, mask_all->ne[0], n_query, 1, n_stream,
+                    mask_all->nb[1], mask_all->nb[2], mask_all->nb[3], first*mask_all->nb[1]));
         if (shared_qsa != qsa_inps.end() && shared_qsa->second->use_kq_mask && !shared_qsa->second->blk_bias) {
-            kq_mask = qwen4exp_apply_cell_visibility(ctx0, kq_mask, shared_qsa->second->bias, first);
+            kq_mask = qwen4exp_apply_cell_visibility(ctx0, kq_mask, shared_qsa->second->bias, first, input_views);
         }
         ggml_tensor * top_k = ggml_view_4d(ctx0, indices_all, indices_all->ne[0], n_query, 1, n_stream,
                 indices_all->nb[1], indices_all->nb[2], indices_all->nb[3], first*indices_all->nb[1]);
