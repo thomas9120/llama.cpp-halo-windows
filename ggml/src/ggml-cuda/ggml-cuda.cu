@@ -6421,7 +6421,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
-    const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+    bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+#if defined(_WIN32) && defined(GGML_USE_HIP)
+    // Avoid GPU execution on pinned host buffers on Windows RDNA3.5. Keep pinned transfers enabled.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[dev_ctx->device].cc)) {
+        integrated = false;
+    }
+#endif
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
