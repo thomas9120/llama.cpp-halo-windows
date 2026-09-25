@@ -466,6 +466,8 @@ The script selects the VS 2022 x64 toolchain and builds `llama-server`, `llama-c
 
 A Vulkan-capable GPU driver is required to run the binaries.
 
+For stable ZIP releases through GitHub Actions, see [Windows Vulkan releases](windows-vulkan-release.md).
+
 **w64devkit**
 
 Download and extract [`w64devkit`](https://github.com/skeeto/w64devkit/releases).

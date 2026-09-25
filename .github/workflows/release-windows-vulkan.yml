@@ -1,0 +1,100 @@
+name: Release Windows Vulkan
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release tag (for example, halo-vulkan-v1)'
+        required: true
+        type: string
+      prerelease:
+        description: Mark as a prerelease
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows-vulkan-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      VULKAN_SDK: C:\VulkanSDK\1.4.350.0
+      BUILD_DIR: build-vulkan-release
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate new release tag
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+            throw 'Use a tag containing only letters, digits, dots, underscores, and hyphens.'
+          }
+          git check-ref-format "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid release tag.' }
+          git show-ref --verify --quiet "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -eq 0) { throw 'This tag already exists. Enter a new release tag.' }
+          if ($LASTEXITCODE -ne 1) { throw 'Could not check existing tags.' }
+          $global:LASTEXITCODE = 0
+
+      - name: Install Vulkan SDK 1.4.350.0
+        run: |
+          $Installer = Join-Path $env:RUNNER_TEMP 'vulkan-sdk.exe'
+          $Url = 'https://sdk.lunarg.com/sdk/download/1.4.350.0/windows/vulkansdk-windows-X64-1.4.350.0.exe'
+          curl.exe --fail --location --retry 3 --output $Installer $Url
+          if ($LASTEXITCODE -ne 0) { throw 'Vulkan SDK download failed.' }
+          $ExpectedHash = '855B27BA05D2D8119C5114C5D4FF870CA38F2C632B11E1BB9923B9B7E6ECFE7B'
+          if ((Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash -ne $ExpectedHash) {
+            throw 'Vulkan SDK checksum mismatch.'
+          }
+          $Install = Start-Process -FilePath $Installer -ArgumentList @(
+            '--root', $env:VULKAN_SDK, '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          ) -WindowStyle Hidden -Wait -PassThru
+          if ($Install.ExitCode -ne 0) { throw "Vulkan SDK installation failed: $($Install.ExitCode)." }
+          if (-not (Test-Path -LiteralPath "$env:SystemRoot/System32/vulkan-1.dll")) {
+            throw 'The Vulkan loader is required for package startup checks.'
+          }
+          Remove-Item -LiteralPath $Installer
+
+      - name: Build and package Windows binaries
+        run: |
+          .\test-windows.ps1 -SourceOnly
+          .\build-windows-vulkan.ps1 -VulkanSdkPath $env:VULKAN_SDK -BuildDir $env:BUILD_DIR -Jobs 4 -Portable
+          .\scripts\package-windows-vulkan.ps1 -BuildDir $env:BUILD_DIR
+
+      - name: Publish release
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          $Assets = @(Get-ChildItem "$env:BUILD_DIR/release/*.zip", "$env:BUILD_DIR/release/*.sha256" | ForEach-Object FullName)
+          if ($Assets.Count -ne 2) { throw 'Expected one ZIP and one checksum file.' }
+          $Notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          @(
+            'Windows x64 Vulkan build of the Strix Halo fork, built with Vulkan SDK 1.4.350.0.',
+            '',
+            'Extract the ZIP and run the tools in bin. Visual C++ runtimes are bundled; a Vulkan-capable graphics driver is required. The Vulkan SDK is not required to run this package.',
+            '',
+            'CI validates source guards and executable startup. GPU inference is not tested on the hosted runner.',
+            '',
+            "Source commit: $env:GITHUB_SHA"
+          ) | Set-Content -LiteralPath $Notes -Encoding utf8
+          $ReleaseArgs = @('release', 'create', $env:RELEASE_TAG) + $Assets + @(
+            '--target', $env:GITHUB_SHA, '--title', $env:RELEASE_TAG, '--notes-file', $Notes
+          )
+          if ($env:PRERELEASE -eq 'true') { $ReleaseArgs += '--prerelease' }
+          gh @ReleaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
