@@ -2547,6 +2547,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // Reuse prefill input slices so each backend copies a slice only once.
+        std::vector<ggml_tensor *> qsa_input_views;
         llm_graph_input_qsa_k * qsa_k_inp = nullptr;
 
         void build_qsa_store_k(

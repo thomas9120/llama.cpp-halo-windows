@@ -149,6 +149,37 @@ static void run_case(const char * name, const std::vector<cell_input> & input,
     printf("PASS: %s (%s)\n", name, compact ? "compact blocks" : (blocks ? "explicit blocks" : (blk_bias ? "block bias" : "cell bias")));
 }
 
+static void check_shared_input_views() {
+    auto * ctx = ggml_init({1024*1024, nullptr, true});
+    check(ctx != nullptr, "view test context allocation failed");
+    std::vector<ggml_tensor *> views;
+    auto * bias = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 10, 1);
+    auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 10, 1, 1);
+    for (int layer = 0; layer < 12; ++layer) {
+        for (int first = 0; first < 10; first += 4) {
+            const int count = std::min(4, 10-first);
+            auto * score = qwen4exp_shared_input_view(&views, ggml_view_3d(ctx, bias, 8, count, 1,
+                    bias->nb[1], bias->nb[2], first*bias->nb[1]));
+            auto * attn = qwen4exp_shared_input_view(&views, ggml_view_4d(ctx, bias, 8, count, 1, 1,
+                    bias->nb[1], bias->nb[2], bias->nb[2], first*bias->nb[1]));
+            check(score == attn, "equivalent bias slices were not shared");
+            for (int use = 0; use < 2; ++use) {
+                qwen4exp_shared_input_view(&views, ggml_view_4d(ctx, mask, 8, count, 1, 1,
+                        mask->nb[1], mask->nb[2], mask->nb[3], first*mask->nb[1]));
+            }
+        }
+    }
+    check(views.size() == 6, "layer count multiplied input slices");
+    auto * other = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 10, 1);
+    auto * different_source = qwen4exp_shared_input_view(&views, ggml_view_3d(ctx, other, 8, 4, 1, other->nb[1], other->nb[2], 0));
+    auto * different_stride = qwen4exp_shared_input_view(&views, ggml_view_3d(ctx, bias, 8, 4, 1, 2*bias->nb[1], bias->nb[2], 0));
+    check(different_source != views[0] && different_stride != views[0] && views.size() == 8, "different source or strides were aliased");
+    auto * unshared = ggml_view_3d(ctx, bias, 8, 4, 1, bias->nb[1], bias->nb[2], 0);
+    check(qwen4exp_shared_input_view(nullptr, unshared) == unshared, "disabled sharing changed the input view");
+    ggml_free(ctx);
+    printf("PASS: shared input slices preserve source, offset, shape, and strides\n");
+}
+
 static void check_final_mask(ggml_type type, ggml_backend_t backend) {
     ggml_context * ctx = ggml_init({1024*1024, nullptr, true});
     check(ctx != nullptr, "mask test context allocation failed");
@@ -159,7 +190,8 @@ static void check_final_mask(ggml_type type, ggml_backend_t backend) {
     float original[32];
     for (int i = 0; i < 32; ++i) { original[i] = i%5 == 0 ? -INFINITY : -2.0f; }
     auto * mask = type == GGML_TYPE_F32 ? raw_mask : ggml_cast(ctx, raw_mask, type);
-    auto * result = qwen4exp_apply_cell_visibility(ctx, mask, bias, 1);
+    std::vector<ggml_tensor *> views;
+    auto * result = qwen4exp_apply_cell_visibility(ctx, mask, bias, 1, &views);
     if (result->type != GGML_TYPE_F32) { result = ggml_cast(ctx, result, GGML_TYPE_F32); }
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
@@ -200,6 +232,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         std::vector<cell_input> logged;
+        check_shared_input_views();
         for (int j = 0; j < 13526; ++j) { logged.push_back({j < 13522 ? j : j+45, 1}); }
         const std::vector<cell_input> queries = {{13567,1},{13568,1},{13569,1},{13570,1}};
         run_case("reported screenshot layout", logged, queries, 13568, false, false);

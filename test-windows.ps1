@@ -44,7 +44,7 @@ Assert-Source 'tools/server/server-context.cpp' '(?s)SRV_ERR\("pre_decode\(\) fa
 Assert-Source 'tools/server/server-context.cpp' '(?s)void abort_all_slots\([^{}]*\)\s*\{.*?slot\.release\(\);\s*slot\.prompt_clear\(\);' 'Aborted slots discard incomplete cached prompts'
 Assert-Source 'src/models/qwen4exp.cpp' 'res\s*&=\s*contiguous_cells\s*==\s*mctx->qsa_contiguous_cells\(params.ubatch\)' 'QSA graph reuse checks cache layout changes'
 Assert-Source 'src/models/qwen4exp.cpp' '(?s)const bool blk_bias\s*=[^;]*qsa_contiguous_cells\(ubatch\)\s*\|\|\s*qwen4exp_use_block_selection\(' 'Gapped Q8 caches use per-cell visibility'
-Assert-Source 'src/models/qwen4exp.cpp' 'kq_mask\s*=\s*qwen4exp_apply_cell_visibility\(ctx0,\s*kq_mask,\s*shared_qsa->second->bias,\s*first\)' 'Final QSA attention preserves per-cell exclusions'
+Assert-Source 'src/models/qwen4exp.cpp' 'kq_mask\s*=\s*qwen4exp_apply_cell_visibility\(ctx0,\s*kq_mask,\s*shared_qsa->second->bias,\s*first,\s*input_views\)' 'Final QSA attention preserves per-cell exclusions'
 
 if ($SourceOnly) {
     Write-Host 'Source guards passed. Build and runtime tests were not run.'
@@ -138,8 +138,10 @@ try {
     Set-Content -LiteralPath (Join-Path $LogDir 'qsa-input-test.inc') -Value $QsaSource.Substring($QsaStart, $QsaEnd-$QsaStart) -Encoding ascii
     $QwenSource = Get-Content (Join-Path $RepoRoot 'src/models/qwen4exp.cpp') -Raw
     $Visibility = [regex]::Match($QwenSource, '(?ms)^static ggml_tensor \* qwen4exp_apply_cell_visibility\(.*?^\}')
+    $SharedView = [regex]::Match($QwenSource, '(?ms)^static ggml_tensor \* qwen4exp_shared_input_view\(.*?^\}')
     if (-not $Visibility.Success) { throw 'QSA visibility test extraction needs review after an upstream change.' }
-    Set-Content -LiteralPath (Join-Path $LogDir 'qsa-visibility-test.inc') -Value $Visibility.Value -Encoding ascii
+    if (-not $SharedView.Success) { throw 'QSA view test extraction needs review after an upstream change.' }
+    Set-Content -LiteralPath (Join-Path $LogDir 'qsa-visibility-test.inc') -Value ($SharedView.Value + "`n" + $Visibility.Value) -Encoding ascii
     $QsaExe = Join-Path $LogDir 'test-qsa.exe'
     Invoke-Logged 'qsa-build' (Join-Path $RocmPath 'lib/llvm/bin/clang++.exe') @(
         '-std=c++17', '-O2', '-fms-runtime-lib=dll', '-DGGML_SHARED',

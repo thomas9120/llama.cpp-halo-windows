@@ -99,6 +99,83 @@ The cleaned production build passed the full `test-windows.ps1 -Jobs 8` suite, i
 
 Production `ggml-hip.dll` SHA-256: `f0778135f1bf352a12c560927b3cc1dccf01e6c74c5893017115be21bf11b9ac`. The complete tested application DLL/executable set was installed into the existing local launcher directory after backing up and hashing its previous files. Installed hashes match the tested build. The runtime SDK and driver were retained. This validation does not cover adaptive drafting, a different quantization, or the longer endurance run.
 
+### Lazy-loading comparison with Unsloth b11160 (2026-09-25)
+
+The user's current Unsloth executable reports build `11160`, commit `a3c12db9d`, which is newer than the b11139 comparison below. The [b11160 release](https://github.com/unslothai/llama.cpp/releases/tag/b11160-mix-a6922cc) manifest identifies exact source `a3c12db9dfc9a5bdf93df199ec370e9faf117c69`. The downloaded source archive SHA-256 matches the release asset digest. This source inspection compares that archive with local commit `9664073a370741d8c7511f9e8a0a48813d8bc9cd`; it does not measure runtime allocation deltas.
+
+For the supplied `--lazy-mode on --load-mode dio` settings:
+
+- Both loaders mark the PLE table with `TENSOR_READ_LAZY`, select an ordinary CPU buffer type, and keep the lazy context mapped even when the other weights use a different load mode.
+- Windows read-only mapping and batched `PrefetchVirtualMemory` logic are the same. Both construct PLE row indices and use `GET_ROWS` on the mapped table. The local explicit reader and speculative PLE prefetch hook require `on-direct` and are inactive with `on`; b11160 does not contain that explicit reader.
+- Both builds reject direct GPU execution on `ROCm_Host` on this hardware. In the b11160 source the internal integrated flag is already false, and the release also includes Unsloth #158. The local safeguard rejects host compute at the compatibility check. Neither change disables the ordinary CPU lazy mapping.
+- Unsloth includes [#152](https://github.com/unslothai/llama.cpp/pull/152), which splits mapped buffer ranges around large gaps occupied by another context's tensors. Local code uses one enclosing range. This is a real difference, but it does not establish a Windows commit saving: the CPU backend wraps the mapped pointer, while the reported residency problem concerns backends such as Metal. With DIO and this model's single lazy PLE table, it is not a strong explanation for the observed increase.
+- Non-lazy memory differs substantially in implementation. Local HIP maintains an additional pooled QSA key cache absent from this Unsloth source, and uses a hybrid indexer cache for the Qwen MTP context instead of the plain draft attention cache. The target model metadata has 12 compressed attention layers and indexer width 128; its extra pooled-key tensor payload at 262,144 context is `12 * 128 * 65,536 * 4 = 402,653,184` bytes (384 MiB), excluding draft tensors and allocation overhead. That contribution is too small by itself to explain several GiB of extra commit. Compute-buffer lifetimes and draft memory still need matched allocation measurements.
+
+No lazy-loading patch was identified for blind import, and no inference code or launcher binaries were changed. Source snapshots, focused diffs, PR metadata, and binary hashes are saved under the ignored `build-mtp-buffer-fix/unsloth-lazy-comparison-20260925` directory. No model was loaded for this comparison; the AtomicChat metadata was read without evaluating tensors.
+
+### Matched b11160 memory replay (2026-09-25)
+
+Followed the source comparison with sequential GPU runs using the existing 78,808-token fixture containing the text history and its last screenshot. The other 13 images are replaced by omission markers. Each arm processed the prompt from an empty cache, generated 512 tokens, and repeated the identical request with prompt-cache reuse. Generated tool calls were saved, never executed. All requests completed normally, including the local control with all speculation disabled.
+
+The matched arms used AtomicChat AD-4.27bpw-Q4_K_M-M64, its F16 projector, the shared Q4_K_M MTP draft, context 262,144, batch 4,096, microbatch 2,048, F16 K/V, GPU offload, Flash Attention, lazy mode `on`, DIO, one unified slot, 16 checkpoints, and the supplied MTP/ngram and sampling settings. Adaptive drafting was off. Requests used seed 4242 and `ignore_eos=true`. Logging was raised to level 4 and colors disabled. No serialization, graph-disable, host-access, or lazy-mode override was enabled.
+
+Windows memory counters were sampled every two seconds. Values below are stage maxima in GiB. System commit before launch was 28.97 GiB for Unsloth and 28.94 GiB for local. Process-private commit is reported separately because system commit also includes driver and background allocations.
+
+| Stage | Unsloth private | Local private | Unsloth system commit | Local system commit |
+| --- | ---: | ---: | ---: | ---: |
+| Loaded and ready | 72.42 | 62.90 | 108.44 | 100.71 |
+| Initial screenshot replay | 75.66 | 79.46 | 113.12 | 120.84 |
+| Cached repeat | 76.01 | 79.46 | 113.48 | 120.87 |
+
+Both logs confirm lazy reads for the same 36,621 MiB PLE table and identical target model buffer sizes. Local private commit remains near 64 GiB through the text prefix, then rises by 14.40 GiB in one sample during the 1,260-token image batch at approximately 77.5K filled context. The local control without a draft model and with `--spec-type none` reproduces the jump (14.41 GiB), reaching 76.22 GiB private commit from 60.82 GiB when ready. MTP is therefore not required for this increase. Its lower system-commit result is not a matched background-memory comparison.
+
+A separate local diagnostic replay exposed the allocator's existing reallocation message in Release without changing allocation behavior. At image decode, the target `ROCm0` compute buffer grows from 1,494.45 MiB to 14,116.89 MiB, and `ROCm_Host` compute grows from 68.21 MiB to 606.42 MiB. These are graph compute workspaces, not the lazy model mapping. This localizes a substantial contribution to the screenshot-related increase; it does not attribute every byte of process or system growth to those two buffers. Source inspection shows that image embeddings do not qualify for the text-only compact/maskless QSA path. The exact tensor lifetimes or fallback allocations responsible for the large workspace still require isolation before choosing a fix.
+
+The matched MTP arms decoded at 15.08 and 14.54 tokens/s for Unsloth, versus 17.86 and 16.66 for local (initial and repeat respectively). Initial prompt processing was 313.57 versus 569.81 tokens/s. Sampled completions differ, so these are workload observations, not identical-token performance measurements or a comparison against the unguarded local build.
+
+The local tested HIP DLL hash is `71f4e068f5df78c45d57c7522a17ebfe0efefa0c4ef2063a6753c7bf8d0bb32a`. Module inventories confirm Unsloth used its bundled HIP/BLAS libraries; local used system HIP and TheRock BLAS libraries. Runtime differences remain a confounder. The allocation diagnostic changes were temporary; no inference fix or launcher replacement was made. Launch commands, module paths, memory samples, timings, diagnostic patch, and logs are under `build-mtp-buffer-fix/unsloth-lazy-comparison-20260925`, including `matched-memory-summary.json`. These bounded replays do not establish stability at 179K-262K filled context.
+
+### Tensor attribution of the image workspace (2026-09-25)
+
+A second temporary allocator trace records live allocation ranges at workspace growth above 8 GiB, together with tensor types, dimensions, flags, remaining consumers, and the scheduled graph. The same 78,808-token single-image replay and cached repeat completed with speculation disabled. The allocation behavior was unchanged. At the 14,116.888 MiB GPU workspace peak, 13,964.377 MiB belongs to live tensors; the remaining approximately 152.511 MiB is outside those live payloads. The triggering allocation is `ffn_moe_weighted-0`, but it is not the dominant consumer.
+
+The dominant allocations are 144 distinct scheduler input copies, all simultaneously live at the measured peak:
+
+| Type and dimensions | Count | Combined MiB |
+| --- | ---: | ---: |
+| F32 `[78848,512,1,1]` | 48 | 7392.000 |
+| F16 `[78848,512,1,1]` | 48 | 3696.000 |
+| F32 `[78848,236,1,1]` | 24 | 1703.625 |
+| F16 `[78848,236,1,1]` | 24 | 851.813 |
+
+Their exact combined payload is 14,306,181,120 bytes (13.324 GiB), or 96.65% of the GPU workspace. These copies have neither the graph-output flag nor allocator pinning enabled. Following each copy's source dependency through its views identifies only two shared roots: the F32 QSA visibility bias and the F16 attention mask. Consumers divide into 36 bias additions, 36 bias clamps, 36 mask casts, and 36 mask additions.
+
+The image contains 1,260 query tokens, processed as strips of 512, 512, and 236 across 12 QSA layers. `build_qsa_top_k` creates fresh bias and mask views for each strip and layer; `build_attn_qsa` and `qwen4exp_apply_cell_visibility` create another set. This yields `12 layers * 3 strips * 2 uses * 2 input types = 144` separate input views. The scheduler keys copies by source tensor identity, so equal slices represented by different view objects receive separate GPU buffers. It allocates the input copies at the beginning of their backend split, making them coexist before the later layers consume them. This is not evidence of a persistent leak or of the PLE table becoming eager.
+
+The exact Unsloth b11160 source uses the shared full bias/mask tensors in its unstripped QSA graph instead of constructing this repeated set of per-layer input slices. This source difference explains the observed copy multiplication; it does not establish that replacing the complete Unsloth QSA implementation would preserve this fork's performance or image visibility fixes.
+
+The first targeted fix to test is reuse of identical bias/mask views within one graph, keyed by the actual input and slice layout, across layers and consumers. Preserve per-cell exclusions, strip boundaries, graph-reuse invalidation, and the host-buffer safeguard. Check that the duplicate input copies disappear, then compare outputs, memory, decode, prompt-cache reuse, and MTP behavior. This attribution run does not implement or validate that fix.
+
+The diagnostic patch, peak JSON, graph-node map, source-root grouping, and baseline binaries are in the ignored `build-mtp-buffer-fix/tensor-workspace-20260925` directory. Replay logs and memory samples are in `build-mtp-buffer-fix/unsloth-lazy-comparison-20260925/local-tensor-trace`. Temporary source changes were removed and original binaries restored after the replay.
+
+### Shared prefill input-view fix (2026-09-25)
+
+The Qwen graph builder now reuses mask/bias views only when their source tensor, byte offset, shape, and all strides match. The view list belongs to the graph builder, so it cannot retain tensors from a different graph. Layer-specific scores and selected indices remain separate. Masking arithmetic, per-cell exclusions, graph-reuse invalidation, lazy loading, and the Windows host-buffer safeguard are unchanged.
+
+Sharing covers embedding batches and text batches with at least 128 queries per stream, matching the existing QSA prefill cutoff. Small text/decode batches keep their original views. A broader prototype that also shared decode views failed the output comparison: probability vectors initially matched, then diverged during later decode steps. Its cause remains unestablished, so that behavior was excluded. An image-only intermediate passed exact output comparisons but still hit the memory guard during the large text continuation after the image. Extending sharing to large prefill batches removes that additional duplication without changing small decode graphs.
+
+The existing QSA harness checks that the 12-layer, three-strip input pattern reuses six views instead of creating 144 distinct ones. It also checks source/stride separation and disabled sharing. Existing two-stream F32/F16 visibility checks pass on CPU and ROCm. The final patch passed the full `test-windows.ps1 -Jobs 8` suite and the Windows Vulkan build.
+
+With the final patch, the 78,808-token MTP screenshot replay and its cached repeat both produce exactly the same normalized content, reasoning, and tool-call deltas as the preserved baseline, with 512 generated tokens per request. Draft/accepted counts also match (423/292 initially and 299/242 on repeat). Peak process-private commit falls from 79.464 to 65.651 GiB, a 13.813 GiB reduction. System commit peaks at 107.25 GiB versus 120.87 GiB across the baseline requests; background memory was not held constant. The earlier image-only control without speculation also matched both baseline responses and reduced private commit from 76.222 to 62.408 GiB. That control is not a separate non-speculative endurance test of the final expanded prefill patch.
+
+Final matched MTP decode rates are 17.88/16.55 tokens/s (initial/repeat), compared with 17.86/16.66 before the fix. The extra continuation adds about 62.9K prompt tokens and another screenshot. With microbatch 2,048, the watchdog stopped it after the log reached 132,052 cached tokens: system commit reached 124.821 GiB, leaving less than the configured 3 GiB margin. This was a deliberate guard stop, not a reported HIP crash; remaining long-context memory growth is not fixed by input sharing alone.
+
+With microbatch reduced to 1,024 and all other launch settings retained, all three requests completed. The extended request reused 78,804 cached tokens, evaluated 62,939 new prompt tokens including the second screenshot, and generated 512 tokens, ending at 142,254 cached tokens. Extended decode was 14.65 tokens/s. Peak private commit was 64.727 GiB and system commit 112.807 GiB. Smaller batching changes prompt numerics and sampled completions, so this is continuation coverage and a measured lower-memory configuration, not an identical-output comparison with microbatch 2,048. Adaptive drafting and a 179K-262K endurance run remain untested.
+
+The Vulkan build and Radeon 8060S device detection passed. Its bounded model replay was stopped during warmup when available physical RAM fell below the 2 GiB guard, before screenshot inference; Vulkan model-level validation is therefore incomplete. All task-owned servers were stopped after the checks. The nonzero process exit codes in successful replay metadata come from the harness terminating its idle server after successful requests.
+
+Build logs, comparison summaries, and final binary hashes are under `build-mtp-buffer-fix/shared-input-fix-20260925`; raw replay artifacts remain under `build-mtp-buffer-fix/unsloth-lazy-comparison-20260925`. No launcher directory has been replaced and no commit or release has been created.
+
 ### Comparison with Unsloth b11139 (2026-09-25)
 
 The user reported a decode slowdown after the workaround and successful screenshot use with Unsloth. The installed Unsloth build identifies as `b11139-d79953103`. Its [release manifest and exact source archive](https://github.com/unslothai/llama.cpp/releases/tag/b11139-mix-a6922cc) identify source commit `d799531035c892f42c9ada5e9b0403060213b266` and include [Unsloth PR #158](https://github.com/unslothai/llama.cpp/pull/158), commit `abfc45b9cb21eae4848cb82196e659f42c9a8341`. Although that PR is open, it is pinned into the released mix. Its buffer-compatibility restriction has the same effect as this fork's safeguard on Windows gfx1151: pinned staging remains enabled and direct GPU compute on `ROCm_Host` is rejected. Unsloth's success therefore does not show that unrestricted host compute is safe.
